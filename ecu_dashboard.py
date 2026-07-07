@@ -4,13 +4,23 @@ ECU Dashboard — Serial monitor for the ESP32 ECU shield.
 Serial architecture:
   U0 (USB/Serial) → EXE debug terminal  (commands, data stream)
   U2 (Serial2)    → Pixhawk telemetry   (bridged as [Serial2] lines by ESP32)
-  CAN / TWAI      → ESC                 (RPM, voltage, power — placeholder)
+  CAN / TWAI      → ESC via SN65HVD230  (raw frames streamed as CAN:RX lines)
+
+Shield I/O covered here:
+  4x MAX31855 thermocouples (SPI, CS via PCF8575)  → TC card
+  5x MOSFET PWM outputs (GPIO 32/33/25/26/27)      → MOSFET card
+  2x QNDB6 current sensors (GPIO 34/35)            → Current card
+  Spare analog VP/VN (GPIO 36/39)                  → Analog readouts
+  X9C digital pot (U/D=12, INC=13, CS on expander) → Digital Pot card
+  Piezo/atomizer square wave (GPIO 15)             → Piezo card
+  PCF8575 expander raw access                      → Commands tab
 
 Build to EXE:
     pip install pyserial pyinstaller
     pyinstaller --onefile --windowed --name ECU_Dashboard ecu_dashboard.py
 """
 
+import re
 import tkinter as tk
 from tkinter import ttk, scrolledtext, messagebox
 import serial
@@ -46,11 +56,16 @@ BAUD         = 115200
 HB_TIMEOUT_S = 3.5
 LED_FLASH_MS = 180
 
-# TC channel names (index 0-3 → TC1-TC4)
-TC_NAMES = ["TIT", "EGT", "Coil Temp", "Bearing Temp"]
+# TC channel names (index 0-3 → TC1-TC4) — order matches shield CS1-CS4 wiring
+TC_NAMES = ["TIT", "EGT", "Bearing Temp", "Coil Temp"]
 
 # MOSFET channel names (index 0-4 → M1-M5)
 MOSFET_NAMES = ["Fuel Pump", "Cooling Pump", "Fuel Sol.", "Cooling Sol.", "Glow Plug"]
+
+# Hargrave microDRIVE error bitfield (esc.Status error_count, bits 0-12)
+ESC_ERROR_BITS = ["OVER TEMP", "BUS OC", "PHASE OC", "OVER V", "UNDER V",
+                  "RIPPLE", "SIG LOSS", "SATURATED", "MOTOR OT", "RPM LIM",
+                  "ERROR", "SHORTED", "STARTUP FAIL"]
 
 # ── LED indicator ─────────────────────────────────────────────────────────────
 class LED(tk.Canvas):
@@ -129,9 +144,17 @@ class SerialWorker(threading.Thread):
                     chunk = ser.read(512)
                     if chunk:
                         buf += chunk
+                        # Don't let binary junk grow the buffer forever if the
+                        # stream never contains a newline.
+                        if len(buf) > 4096:
+                            buf = buf[-1024:]
                         while b"\n" in buf:
                             line, buf = buf.split(b"\n", 1)
-                            txt = line.decode("utf-8", errors="replace").strip()
+                            # Keep printable ASCII only — MAVLink/noise bytes
+                            # otherwise corrupt the Tk text widgets.
+                            txt = "".join(
+                                chr(b) if 32 <= b < 127 or b == 9 else "·"
+                                for b in line).strip("· \t\r")
                             if txt:
                                 self.rx_q.put(("line", txt))
         except serial.SerialException as e:
@@ -146,22 +169,37 @@ class SerialWorker(threading.Thread):
 # ── Quick-command catalogue ───────────────────────────────────────────────────
 COMMANDS = [
     ("THERMOCOUPLE", [
-        ("TIT Read",         "tc read 1"),
-        ("EGT Read",         "tc read 2"),
-        ("Coil Temp Read",   "tc read 3"),
-        ("Bearing Temp Read","tc read 4"),
-        ("Read All TCs",     "tc read all"),
+        ("TIT Read",          "tc read 1"),
+        ("EGT Read",          "tc read 2"),
+        ("Bearing Temp Read", "tc read 3"),
+        ("Coil Temp Read",    "tc read 4"),
+        ("Read All TCs",      "tc read all"),
+        ("TC Scan (debug)",   "tc scan"),
+        ("Mode MAX31855",     "tc mode 31855"),
+        ("Mode MAX6675",      "tc mode 6675"),
     ]),
     ("STREAM", [
         ("Stream ON",  "stream on"),
         ("Stream OFF", "stream off"),
+        ("Rate 1 Hz",  "stream rate 1"),
+        ("Rate 5 Hz",  "stream rate 5"),
+        ("Rate 10 Hz", "stream rate 10"),
+        ("Rate 20 Hz", "stream rate 20"),
+        ("Rate 50 Hz", "stream rate 50"),
     ]),
     ("CURRENT SENSORS", [
-        ("Read All", "current all"),
-        ("VP",       "current vp"),
-        ("VN",       "current vn"),
-        ("A",        "current a"),
-        ("B",        "current b"),
+        ("Read All",       "current all"),
+        ("Battery (34)",   "current a"),
+        ("Load (35)",      "current b"),
+    ]),
+    ("DIGITAL POT", [
+        ("Position",  "pot pos"),
+        ("Up 1",      "pot up 1"),
+        ("Down 1",    "pot down 1"),
+        ("Up 10",     "pot up 10"),
+        ("Down 10",   "pot down 10"),
+        ("Reset (0)", "pot reset"),
+        ("Store NVM", "pot store"),
     ]),
     ("MOSFETS", [
         ("All ON",           "mosfet all on"),  ("All OFF",          "mosfet all off"),
@@ -181,13 +219,24 @@ COMMANDS = [
     ("PIXHAWK (U2)", [
         ("Serial2 Status", "serial2 send STATUS"),
         ("Serial2 Test",   "serial2 send PING"),
+        ("Baud 57600",     "serial2 baud 57600"),
+        ("Baud 115200",    "serial2 baud 115200"),
+        ("Hex Dump ON",    "serial2 hex on"),
+        ("Hex Dump OFF",   "serial2 hex off"),
     ]),
-    ("PIEZO", [
+    ("PIEZO / ATOMIZER", [
         ("Piezo ON",  "piezo on"),
         ("Piezo OFF", "piezo off"),
     ]),
-    ("CAN / ESC", [
-        ("CAN Status", "can"),
+    ("CAN / ESC (DroneCAN)", [
+        ("ESC Telemetry", "can esc"),
+        ("CAN Status",    "can status"),
+        ("ESC STOP",      "can stop"),
+        ("RX Print ON",   "can print on"),
+        ("RX Print OFF",  "can print off"),
+        ("Baud 1M (std)", "can baud 1000"),
+        ("Baud 500k",     "can baud 500"),
+        ("Baud 250k",     "can baud 250"),
     ]),
     ("SYSTEM", [
         ("Status",    "status"),
@@ -213,9 +262,13 @@ class ECUDashboard(tk.Tk):
         self._hb_alive   = False
 
         self._tc_vals    = ["---"] * 4
-        self._curr_vals  = ["---"] * 4
+        self._curr_vals  = ["---"] * 2
         self._mosfet_duty= [0] * 5
         self._m_inhibit  = [False] * 5
+        self._pot_pos    = 0
+        self._pot_inhibit= False
+        self._can_rx     = 0
+        self._can_last_rx= 0
 
         self._history:   list[str] = []
         self._hist_idx   = -1
@@ -324,14 +377,20 @@ class ECUDashboard(tk.Tk):
 
     # ── Dashboard tab ────────────────────────────────────────────────────────
     def _build_dashboard(self, parent):
-        # Row 1: TC + MOSFETs + Current
+        # Row 1: TC + MOSFETs + Current/Analog
         row1 = tk.Frame(parent, bg=BG)
         row1.pack(fill="x", padx=8, pady=(8, 4))
         self._build_tc_card(row1)
         self._build_mosfet_card(row1)
         self._build_current_card(row1)
 
-        # Row 2: CAN / ESC banner
+        # Row 2: Digital pot + Piezo/Atomizer
+        row2 = tk.Frame(parent, bg=BG)
+        row2.pack(fill="x", padx=8, pady=(0, 4))
+        self._build_pot_card(row2)
+        self._build_piezo_card(row2)
+
+        # Row 3: CAN / ESC banner
         self._build_can_card(parent)
 
         # Row 3: U0 terminal + U2 Pixhawk (side by side, fills remaining space)
@@ -366,6 +425,11 @@ class ECUDashboard(tk.Tk):
                      font=FONT_UI).pack(side="left", padx=(3,0))
             self._tc_labels.append(val)
 
+        # Expander / I2C health line (populated from EXP/IFAIL/IREC stream keys)
+        self._exp_lbl = tk.Label(c, text="", bg=SURF, fg=TEXT_DIM,
+                                 font=FONT_UI_SML, anchor="w")
+        self._exp_lbl.pack(fill="x", pady=(4, 0))
+
     # ── MOSFET card ──────────────────────────────────────────────────────────
     def _build_mosfet_card(self, parent):
         c = card(parent, "MOSFETs  (duty 0–10)")
@@ -399,16 +463,16 @@ class ECUDashboard(tk.Tk):
             self._m_vallbls.append(vl)
             self._m_btns.append(btn)
 
-    # ── Current sensor card ───────────────────────────────────────────────────
+    # ── Current sensor / analog card ──────────────────────────────────────────
     def _build_current_card(self, parent):
-        c = card(parent, "Current Sensors")
+        c = card(parent, "Current / Analog")
         c.master.pack(side="left", fill="both", expand=True, padx=(4,0))
         self._curr_labels: list[tk.Label] = []
-        for name in ("VP", "VN", "A", "B"):
+        for name in ("Battery (34)", "Load (35)"):
             row = tk.Frame(c, bg=SURF)
             row.pack(fill="x", pady=3)
             tk.Label(row, text=name, bg=SURF, fg=TEXT_DIM,
-                     font=FONT_UI, width=4, anchor="w").pack(side="left")
+                     font=FONT_UI_SML, width=11, anchor="w").pack(side="left")
             val = tk.Label(row, text="  ---  ", bg=SURF2, fg=YELLOW,
                            font=FONT_MONO_LG, width=8, anchor="e",
                            relief="flat", padx=6, pady=2)
@@ -417,9 +481,129 @@ class ECUDashboard(tk.Tk):
                      font=FONT_UI).pack(side="left", padx=(3,0))
             self._curr_labels.append(val)
 
+        self._adc_labels: list[tk.Label] = []
+        for name in ("VP (36)", "VN (39)"):
+            row = tk.Frame(c, bg=SURF)
+            row.pack(fill="x", pady=3)
+            tk.Label(row, text=name, bg=SURF, fg=TEXT_DIM,
+                     font=FONT_UI_SML, width=11, anchor="w").pack(side="left")
+            val = tk.Label(row, text="  ---  ", bg=SURF2, fg=CYAN,
+                           font=FONT_MONO_LG, width=8, anchor="e",
+                           relief="flat", padx=6, pady=2)
+            val.pack(side="left")
+            tk.Label(row, text="V", bg=SURF, fg=TEXT_DIM,
+                     font=FONT_UI).pack(side="left", padx=(3,0))
+            self._adc_labels.append(val)
+
+    # ── Digital pot card ──────────────────────────────────────────────────────
+    def _build_pot_card(self, parent):
+        c = card(parent, "Digital Pot  (X9C, 0–99)")
+        c.master.pack(side="left", fill="both", expand=True, padx=(0,4))
+
+        row = tk.Frame(c, bg=SURF)
+        row.pack(fill="x", pady=2)
+        tk.Label(row, text="Wiper", bg=SURF, fg=TEXT_DIM,
+                 font=FONT_UI_SML, width=6, anchor="w").pack(side="left")
+        self._pot_val = tk.Label(row, text="  0", bg=SURF2, fg=PURPLE,
+                                 font=FONT_MONO_LG, width=5, anchor="e",
+                                 relief="flat", padx=6, pady=2)
+        self._pot_val.pack(side="left")
+
+        self._pot_slider = tk.Scale(
+            row, from_=0, to=99, orient="horizontal", length=160,
+            bg=SURF, fg=TEXT_DIM, troughcolor=SURF2,
+            highlightthickness=0, sliderlength=14, showvalue=False,
+            command=self._on_pot_slider)
+        self._pot_slider.pack(side="left", padx=8)
+        self._pot_slider.bind("<ButtonRelease-1>", self._on_pot_release)
+
+        btns = tk.Frame(c, bg=SURF)
+        btns.pack(fill="x", pady=(4, 0))
+        for label, cmd in [("−10", "pot down 10"), ("−1", "pot down 1"),
+                           ("+1", "pot up 1"),     ("+10", "pot up 10"),
+                           ("Reset", "pot reset"), ("Store", "pot store")]:
+            b = tk.Button(btns, text=label, width=5, bg=SURF2, fg=PURPLE,
+                          font=FONT_UI, relief="flat", cursor="hand2",
+                          command=lambda x=cmd: self._quick_cmd(x))
+            b.bind("<Enter>", lambda e, bb=b: bb.config(bg=BORDER))
+            b.bind("<Leave>", lambda e, bb=b: bb.config(bg=SURF2))
+            b.pack(side="left", padx=2)
+
+    def _on_pot_slider(self, value):
+        self._pot_val.config(text=f"{int(float(value)):3d}")
+
+    def _on_pot_release(self, _=None):
+        if not self._pot_inhibit:
+            self._quick_cmd(f"pot set {int(self._pot_slider.get())}")
+
+    def _sync_pot(self, pos):
+        self._pot_inhibit = True
+        self._pot_pos = pos
+        self._pot_slider.set(pos)
+        self._pot_val.config(text=f"{pos:3d}")
+        self._pot_inhibit = False
+
+    # ── Piezo / atomizer card ─────────────────────────────────────────────────
+    def _build_piezo_card(self, parent):
+        c = card(parent, "Piezo / Atomizer  (GPIO15 square wave)")
+        c.master.pack(side="left", fill="both", expand=True, padx=(4,0))
+
+        row = tk.Frame(c, bg=SURF)
+        row.pack(fill="x", pady=2)
+        tk.Label(row, text="Freq", bg=SURF, fg=TEXT_DIM,
+                 font=FONT_UI_SML, width=5, anchor="w").pack(side="left")
+        self._pz_freq = tk.Label(row, text="  ---  ", bg=SURF2, fg=ORANGE,
+                                 font=FONT_MONO_LG, width=8, anchor="e",
+                                 relief="flat", padx=6, pady=2)
+        self._pz_freq.pack(side="left")
+        tk.Label(row, text="Hz", bg=SURF, fg=TEXT_DIM,
+                 font=FONT_UI).pack(side="left", padx=(3, 10))
+        tk.Label(row, text="Duty", bg=SURF, fg=TEXT_DIM,
+                 font=FONT_UI_SML, width=5, anchor="w").pack(side="left")
+        self._pz_duty = tk.Label(row, text=" --- ", bg=SURF2, fg=ORANGE,
+                                 font=FONT_MONO_LG, width=5, anchor="e",
+                                 relief="flat", padx=6, pady=2)
+        self._pz_duty.pack(side="left")
+
+        ctl = tk.Frame(c, bg=SURF)
+        ctl.pack(fill="x", pady=(4, 0))
+        for label, cmd, color in [("ON", "piezo on", GREEN),
+                                  ("OFF", "piezo off", RED)]:
+            b = tk.Button(ctl, text=label, width=5, bg=SURF2, fg=color,
+                          font=FONT_UI, relief="flat", cursor="hand2",
+                          command=lambda x=cmd: self._quick_cmd(x))
+            b.bind("<Enter>", lambda e, bb=b: bb.config(bg=BORDER))
+            b.bind("<Leave>", lambda e, bb=b: bb.config(bg=SURF2))
+            b.pack(side="left", padx=2)
+
+        self._pz_freq_var = tk.StringVar()
+        e = tk.Entry(ctl, textvariable=self._pz_freq_var, bg="#0d0d14",
+                     fg=TEXT, font=FONT_MONO, width=7, relief="flat",
+                     insertbackground=TEXT, highlightthickness=1,
+                     highlightbackground=BORDER, highlightcolor=ACCENT)
+        e.pack(side="left", padx=(10, 2), ipady=2)
+        e.bind("<Return>", lambda ev: self._send_pz_freq())
+        b = tk.Button(ctl, text="Set Hz", bg=SURF2, fg=ORANGE, font=FONT_UI,
+                      relief="flat", cursor="hand2", command=self._send_pz_freq)
+        b.pack(side="left", padx=2)
+
+        self._pz_duty_slider = tk.Scale(
+            ctl, from_=0, to=255, orient="horizontal", length=110,
+            bg=SURF, fg=TEXT_DIM, troughcolor=SURF2,
+            highlightthickness=0, sliderlength=14, showvalue=False)
+        self._pz_duty_slider.pack(side="left", padx=(10, 2))
+        self._pz_duty_slider.bind(
+            "<ButtonRelease-1>",
+            lambda ev: self._quick_cmd(f"piezo duty {int(self._pz_duty_slider.get())}"))
+
+    def _send_pz_freq(self):
+        v = self._pz_freq_var.get().strip()
+        if v.isdigit():
+            self._quick_cmd(f"piezo freq {v}")
+
     # ── CAN / ESC banner ─────────────────────────────────────────────────────
     def _build_can_card(self, parent):
-        c = card(parent, "CAN / ESC  —  Motor Controller  (placeholder)")
+        c = card(parent, "ESC  —  microDRIVE LPi via DroneCAN  (1 Mbps, TX=23 RX=4)")
         c.master.pack(fill="x", padx=8, pady=(0, 4))
 
         inner = tk.Frame(c, bg=SURF)
@@ -427,12 +611,13 @@ class ECUDashboard(tk.Tk):
 
         self._can_fields: dict = {}
         specs = [
-            ("RPM",     "---",      " rpm",  CYAN),
-            ("Voltage", "---",      " V",    GREEN),
-            ("Current", "---",      " A",    YELLOW),
-            ("Power",   "---",      " W",    PURPLE),
-            ("Throttle","---",      " %",    ORANGE),
-            ("ESC Status","WAITING","",       RED),
+            ("RPM",       "---",     "",     CYAN),
+            ("Voltage",   "---",     " V",   GREEN),
+            ("Current",   "---",     " A",   YELLOW),
+            ("ESC Temp",  "---",     " °C",  ORANGE),
+            ("Power",     "---",     " %",   PURPLE),
+            ("RX Frames", "0",       "",     TEXT_DIM),
+            ("Bus",       "WAITING", "",     RED),
         ]
         for col, (label, default, unit, color) in enumerate(specs):
             inner.columnconfigure(col, weight=1)
@@ -447,6 +632,54 @@ class ECUDashboard(tk.Tk):
                                 bg=SURF2, fg=TEXT_DIM, font=("Segoe UI", 8))
             unit_lbl.pack(anchor="w")
             self._can_fields[label] = (val, unit, color, unit_lbl)
+
+        # ── ESC command strip: duty / rpm / brake + STOP ──
+        ctl = tk.Frame(c, bg=SURF)
+        ctl.pack(fill="x", pady=(8, 0))
+
+        self._esc_cmd_lbl = tk.Label(ctl, text="CMD: OFF", bg=SURF2, fg=TEXT_DIM,
+                                     font=FONT_MONO_LG, width=14, padx=6, pady=2)
+        self._esc_cmd_lbl.pack(side="left", padx=(0, 12))
+
+        def _mk_cmd(label, unit, build, color):
+            tk.Label(ctl, text=label, bg=SURF, fg=TEXT_DIM,
+                     font=FONT_UI_SML).pack(side="left", padx=(6, 2))
+            var = tk.StringVar()
+            e = tk.Entry(ctl, textvariable=var, bg="#0d0d14", fg=TEXT,
+                         font=FONT_MONO, width=7, relief="flat",
+                         insertbackground=TEXT, highlightthickness=1,
+                         highlightbackground=BORDER, highlightcolor=ACCENT)
+            e.pack(side="left", ipady=2)
+            def send(_=None):
+                v = var.get().strip()
+                if v.lstrip("-").isdigit():
+                    self._quick_cmd(build(v))
+            e.bind("<Return>", send)
+            b = tk.Button(ctl, text="Set", bg=SURF2, fg=color, font=FONT_UI,
+                          relief="flat", cursor="hand2", padx=6, command=send)
+            b.pack(side="left", padx=(2, 0))
+            tk.Label(ctl, text=unit, bg=SURF, fg=TEXT_DIM,
+                     font=FONT_UI_SML).pack(side="left")
+
+        _mk_cmd("Duty",  "%",   lambda v: f"can duty {v}",  CYAN)
+        _mk_cmd("RPM",   "",    lambda v: f"can rpm {v}",   GREEN)
+        _mk_cmd("Brake", "%",   lambda v: f"can brake {v}", ORANGE)
+
+        stop = tk.Button(ctl, text="■ STOP", bg="#3d1420", fg=RED,
+                         font=FONT_UI_B, relief="flat", cursor="hand2",
+                         padx=14, pady=2,
+                         command=lambda: self._quick_cmd("can stop"))
+        stop.bind("<Enter>", lambda e: stop.config(bg="#58182c"))
+        stop.bind("<Leave>", lambda e: stop.config(bg="#3d1420"))
+        stop.pack(side="right", padx=(12, 0))
+
+        # ESC error flags + last raw frame lines
+        self._esc_flags_lbl = tk.Label(c, text="ESC flags: —", bg=SURF,
+                                       fg=TEXT_DIM, font=FONT_MONO, anchor="w")
+        self._esc_flags_lbl.pack(fill="x", pady=(6, 0))
+        self._can_frame_lbl = tk.Label(c, text="last frame: —", bg=SURF,
+                                       fg=TEXT_DIM, font=FONT_MONO, anchor="w")
+        self._can_frame_lbl.pack(fill="x")
 
     # ── Split terminals (U0 + U2 Pixhawk) ────────────────────────────────────
     def _build_terminals(self, parent):
@@ -563,8 +796,26 @@ class ECUDashboard(tk.Tk):
                          lambda v: f"piezo duty {v[0]}")
         self._add_param(param, "Piezo freq",    ["Frequency (Hz)"],
                          lambda v: f"piezo freq {v[0]}")
+        self._add_param(param, "Pot set",       ["Position (0-99)"],
+                         lambda v: f"pot set {v[0]}")
+        self._add_param(param, "Current cal",   ["Zero (V)", "Amps per Volt"],
+                         lambda v: f"current cal {v[0]} {v[1]}")
+        self._add_param(param, "ESC duty",      ["Percent (-100..100)"],
+                         lambda v: f"can duty {v[0]}")
+        self._add_param(param, "ESC RPM",       ["RPM setpoint"],
+                         lambda v: f"can rpm {v[0]}")
+        self._add_param(param, "ESC brake",     ["Percent (0-100)"],
+                         lambda v: f"can brake {v[0]}")
+        self._add_param(param, "CAN send",      ["ID (hex)", "Data bytes (hex, spaced)"],
+                         lambda v: f"can send {v[0]} {v[1]}")
+        self._add_param(param, "Expander bit",  ["Bit (0-15)", "on / off"],
+                         lambda v: f"i2c expander bit {v[0]} {v[1]}")
         self._add_param(param, "Serial2 send",  ["Message"],
                          lambda v: f"serial2 send {v[0]}")
+        self._add_param(param, "Serial2 baud",  ["Baud rate"],
+                         lambda v: f"serial2 baud {v[0]}")
+        self._add_param(param, "Stream rate",   ["Rate (1-50 Hz)"],
+                         lambda v: f"stream rate {v[0]}")
 
     def _add_param(self, parent, label, placeholders, build):
         row = tk.Frame(parent, bg=BG)
@@ -618,6 +869,13 @@ class ECUDashboard(tk.Tk):
         self._worker.start()
         self._conn_btn.config(text="Disconnect", fg=RED)
         self._stream_btn.config(state="normal")
+        # Opening the port resets the ESP32 (~1-2s boot). New firmware streams
+        # by default; for older firmware, nudge it on if no data has arrived.
+        self.after(3000, self._auto_stream_check)
+
+    def _auto_stream_check(self):
+        if self._worker and self._worker.is_alive() and not self._streaming:
+            self._send_raw(b"stream on\n")
 
     def _disconnect(self):
         if self._streaming:
@@ -734,8 +992,50 @@ class ECUDashboard(tk.Tk):
         # Data stream
         if line.startswith("DATA:"):
             self._last_hb = time.time()
+            # Sync the stream toggle with reality (firmware streams at boot)
+            if not self._streaming:
+                self._streaming = True
+                self._stream_btn.config(text="Stream ON", fg=GREEN)
             self._parse_data(line[5:])
             self._log_u0(line, "data")
+            return
+
+        # Raw CAN frames
+        if line.startswith("CAN:RX"):
+            self._can_rx += 1
+            self._can_frame_lbl.config(text="last frame: " + line[7:].strip(),
+                                       fg=CYAN)
+            self._update_can_status()
+            self._log_u0(line, "data")
+            return
+
+        # "tc read" replies also update the TC card, so manual reads show up
+        # even with streaming off. Matches both firmware formats:
+        #   "TC2 (EGT): 26.00 C"   /  "raw: 0x... TC2 (EGT): 26.00 C"
+        #   "TC1 (TIT): FAULT/NC"  /  "TC1 (TIT): OPEN (chip alive, ...)"
+        m = re.search(r"TC([1-4]) \([^)]*\):\s*(.+)$", line)
+        if m:
+            idx = int(m.group(1)) - 1
+            val = m.group(2).strip()
+            fm = re.match(r"(-?\d+\.?\d*)\s*C", val)
+            if fm:
+                self._tc_labels[idx].config(text=f"{float(fm.group(1)):>7.2f}",
+                                            fg=GREEN)
+            else:
+                word = val.split()[0].split("/")[0]  # OPEN / FAULT / SHORT-GND …
+                if word == "NO":
+                    word = "NO MOD"
+                self._tc_labels[idx].config(text=f"{word[:7]:^7}", fg=RED)
+            self._log_u0(line)
+            return
+
+        # Pot position echo ("Pot position: 42/99")
+        if line.startswith("Pot position:"):
+            try:
+                self._sync_pot(int(line.split(":")[1].split("/")[0]))
+            except (ValueError, IndexError):
+                pass
+            self._log_u0(line)
             return
 
         self._log_u0(line)
@@ -747,23 +1047,72 @@ class ECUDashboard(tk.Tk):
                  if "=" in p
                  for k, v in [p.split("=", 1)]}
 
+        TC_FAULTS = {"nan": " FAULT ", "nc": "NO MOD ", "open": " OPEN  ",
+                     "sgnd": "SHT-GND", "svcc": "SHT-VCC"}
         for i in range(4):
             v = parts.get(f"TC{i+1}", "")
-            if v == "nan":
-                self._tc_labels[i].config(text=" FAULT ", fg=RED)
+            if v in TC_FAULTS:
+                self._tc_labels[i].config(text=TC_FAULTS[v], fg=RED)
             elif v:
                 try:
                     self._tc_labels[i].config(text=f"{float(v):>7.2f}", fg=GREEN)
                 except ValueError:
                     pass
 
-        for i, key in enumerate(("I_VP", "I_VN", "I_A", "I_B")):
+        for i, key in enumerate(("I_A", "I_B")):
             v = parts.get(key, "")
             if v:
                 try:
                     self._curr_labels[i].config(text=f"{float(v):>7.3f}")
                 except ValueError:
                     pass
+
+        for i, key in enumerate(("AVP", "AVN")):
+            v = parts.get(key, "")
+            if v:
+                try:
+                    self._adc_labels[i].config(text=f"{float(v):>7.3f}")
+                except ValueError:
+                    pass
+
+        v = parts.get("POT", "")
+        if v:
+            try:
+                self._sync_pot(int(v))
+            except ValueError:
+                pass
+
+        exp = parts.get("EXP", "")
+        if exp:
+            fails = parts.get("IFAIL", "?")
+            recs = parts.get("IREC", "?")
+            if exp == "1":
+                if recs not in ("0", "?"):
+                    self._exp_lbl.config(
+                        text=f"expander OK  ·  {fails} I2C errors, {recs} auto-recoveries",
+                        fg=YELLOW)
+                else:
+                    self._exp_lbl.config(text="expander OK", fg=TEXT_DIM)
+            else:
+                self._exp_lbl.config(
+                    text=f"⚠ EXPANDER OFFLINE — recovering… ({fails} errors)", fg=RED)
+
+        v = parts.get("PZF", "")
+        if v:
+            self._pz_freq.config(text=f"{v:>7}")
+        v = parts.get("PZD", "")
+        if v:
+            self._pz_duty.config(text=f"{v:>4}")
+
+        v = parts.get("CANRX", "")
+        if v:
+            try:
+                self._can_rx = int(v)
+                self._update_can_status()
+            except ValueError:
+                pass
+
+        self._parse_esc(parts)
 
         for i in range(5):
             v = parts.get(f"M{i+1}", "")
@@ -772,6 +1121,108 @@ class ECUDashboard(tk.Tk):
                     self._sync_mosfet(i, int(v))
                 except ValueError:
                     pass
+
+    def _update_can_status(self):
+        val, unit, color, sub = self._can_fields["RX Frames"]
+        val.config(text=str(self._can_rx))
+        sub.config(text="total frames received")
+        bus_val, _, _, bus_sub = self._can_fields["Bus"]
+        if self._can_rx > self._can_last_rx:
+            bus_val.config(text="ONLINE", fg=GREEN)
+            bus_sub.config(text="receiving frames")
+        self._can_last_rx = self._can_rx
+
+    # Decoded microDRIVE telemetry from the stream (ESC_* keys)
+    def _parse_esc(self, parts):
+        specs = [("ESC_RPM", "RPM", "{:.0f}"), ("ESC_V", "Voltage", "{:.2f}"),
+                 ("ESC_I", "Current", "{:.2f}"), ("ESC_T", "ESC Temp", "{:.1f}"),
+                 ("ESC_PWR", "Power", "{:.0f}")]
+
+        # Firmware stops sending values once telemetry is >5s old and sends
+        # ESC_LOST=1 instead — blank everything so stale data never looks live.
+        if parts.get("ESC_LOST"):
+            for _, field, _ in specs:
+                val, unit, color, sub = self._can_fields[field]
+                val.config(text="---" + unit)
+                sub.config(text="ESC disconnected")
+            bus_val, _, _, bus_sub = self._can_fields["Bus"]
+            bus_val.config(text="OFFLINE", fg=RED)
+            bus_sub.config(text="telemetry lost")
+            self._esc_flags_lbl.config(text="ESC flags: —", fg=TEXT_DIM)
+            return
+
+        got_any = False
+        for key, field, fmt in specs:
+            v = parts.get(key, "")
+            if not v:
+                continue
+            try:
+                val, unit, color, sub = self._can_fields[field]
+                val.config(text=fmt.format(float(v)) + unit)
+                sub.config(text="live from ESC")
+                got_any = True
+            except ValueError:
+                pass
+
+        v = parts.get("ESC_AGE", "")
+        if v:
+            try:
+                age = int(v)
+                bus_val, _, _, bus_sub = self._can_fields["Bus"]
+                if age < 1500:
+                    bus_val.config(text="ESC OK", fg=GREEN)
+                    bus_sub.config(text="telemetry fresh")
+                else:
+                    bus_val.config(text="STALE", fg=YELLOW)
+                    bus_sub.config(text=f"last data {age/1000:.1f}s ago")
+            except ValueError:
+                pass
+
+        v = parts.get("ESC_ERR", "")
+        if v:
+            try:
+                flags = int(v, 16)
+                if flags == 0:
+                    self._esc_flags_lbl.config(text="ESC flags: OK", fg=GREEN)
+                else:
+                    names = [n for b, n in enumerate(ESC_ERROR_BITS)
+                             if flags & (1 << b)]
+                    self._esc_flags_lbl.config(
+                        text=f"ESC flags: 0x{flags:X}  " + ", ".join(names), fg=RED)
+            except ValueError:
+                pass
+
+        extra = []
+        if parts.get("ESC_IN"):  extra.append(f"in {parts['ESC_IN']}%")
+        if parts.get("ESC_OUT"): extra.append(f"out {parts['ESC_OUT']}%")
+        if parts.get("ESC_MT"):  extra.append(f"motor {parts['ESC_MT']}°C")
+        if extra and got_any:
+            val, unit, color, sub = self._can_fields["Power"]
+            sub.config(text="  ".join(extra))
+
+        # Node heartbeat / anonymous-frame diagnosis (why telemetry may be absent)
+        NODE_MODES = {"0": "OPERATIONAL", "1": "INITIALIZING", "2": "MAINTENANCE",
+                      "3": "SW UPDATE", "7": "OFFLINE"}
+        bus_val, _, _, bus_sub = self._can_fields["Bus"]
+        if parts.get("ANON"):
+            bus_val.config(text="NO ID", fg=RED)
+            bus_sub.config(text=f"ESC awaiting node-ID allocation ({parts['ANON']} reqs)")
+        elif parts.get("NS_ID") and not parts.get("ESC_AGE"):
+            m = NODE_MODES.get(parts.get("NS_MODE", ""), "?")
+            bus_val.config(text=f"NODE {parts['NS_ID']}", fg=YELLOW)
+            bus_sub.config(text=f"{m}, no esc.Status telemetry yet")
+
+        mode = parts.get("ESC_CMODE", "")
+        if mode:
+            cval = parts.get("ESC_CVAL", "0")
+            if mode == "OFF":
+                self._esc_cmd_lbl.config(text="CMD: OFF", fg=TEXT_DIM)
+            elif mode == "RPM":
+                self._esc_cmd_lbl.config(text=f"CMD: {cval} rpm", fg=GREEN)
+            elif mode == "BRK":
+                self._esc_cmd_lbl.config(text=f"CMD: BRAKE {cval}%", fg=ORANGE)
+            else:
+                self._esc_cmd_lbl.config(text=f"CMD: DUTY {cval}%", fg=CYAN)
 
     # ── Heartbeat watchdog ────────────────────────────────────────────────────
     def _check_heartbeat(self):
@@ -790,6 +1241,9 @@ class ECUDashboard(tk.Tk):
     def _log_u0(self, text: str, tag: str = ""):
         self._terminal.config(state="normal")
         self._terminal.insert("end", text + "\n", tag if tag else ())
+        # Trim so a 50 Hz stream can't grow the widget unbounded over a run
+        if float(self._terminal.index("end-1c").split(".")[0]) > 3000:
+            self._terminal.delete("1.0", "500.0")
         self._terminal.see("end")
         self._terminal.config(state="disabled")
 
@@ -798,6 +1252,8 @@ class ECUDashboard(tk.Tk):
         ts = time.strftime("%H:%M:%S")
         self._pix_term.insert("end", f"[{ts}] ", "dim")
         self._pix_term.insert("end", text + "\n")
+        if float(self._pix_term.index("end-1c").split(".")[0]) > 3000:
+            self._pix_term.delete("1.0", "500.0")
         self._pix_term.see("end")
         self._pix_term.config(state="disabled")
 
