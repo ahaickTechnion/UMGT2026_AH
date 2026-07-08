@@ -59,8 +59,9 @@ LED_FLASH_MS = 180
 # TC channel names (index 0-3 → TC1-TC4) — order matches shield CS1-CS4 wiring
 TC_NAMES = ["TIT", "EGT", "Bearing Temp", "Coil Temp"]
 
-# MOSFET channel names (index 0-4 → M1-M5)
-MOSFET_NAMES = ["Fuel Pump", "Cooling Pump", "Fuel Sol.", "Cooling Sol.", "Glow Plug"]
+# MOSFET channel names (index 0-4 → M1-M5), per verified wiring 2026-07-08:
+# M1/GPIO32=Glow, M2/GPIO33=Sol 2, M3/GPIO25=Sol 1, M4/GPIO26=Pump 2, M5/GPIO27=Pump 1
+MOSFET_NAMES = ["Glow Plug", "Solenoid 2", "Solenoid 1", "Fuel Pump 2", "Fuel Pump 1"]
 
 # Hargrave microDRIVE error bitfield (esc.Status error_count, bits 0-12)
 ESC_ERROR_BITS = ["OVER TEMP", "BUS OC", "PHASE OC", "OVER V", "UNDER V",
@@ -203,11 +204,11 @@ COMMANDS = [
     ]),
     ("MOSFETS", [
         ("All ON",           "mosfet all on"),  ("All OFF",          "mosfet all off"),
-        ("Fuel Pump ON",     "mosfet 1 on"),    ("Fuel Pump OFF",    "mosfet 1 off"),
-        ("Cooling Pump ON",  "mosfet 2 on"),    ("Cooling Pump OFF", "mosfet 2 off"),
-        ("Fuel Sol. ON",     "mosfet 3 on"),    ("Fuel Sol. OFF",    "mosfet 3 off"),
-        ("Cooling Sol. ON",  "mosfet 4 on"),    ("Cooling Sol. OFF", "mosfet 4 off"),
-        ("Glow Plug ON",     "mosfet 5 on"),    ("Glow Plug OFF",    "mosfet 5 off"),
+        ("Glow Plug ON",     "mosfet 1 on"),    ("Glow Plug OFF",    "mosfet 1 off"),
+        ("Solenoid 2 ON",    "mosfet 2 on"),    ("Solenoid 2 OFF",   "mosfet 2 off"),
+        ("Solenoid 1 ON",    "mosfet 3 on"),    ("Solenoid 1 OFF",   "mosfet 3 off"),
+        ("Fuel Pump 2 ON",   "mosfet 4 on"),    ("Fuel Pump 2 OFF",  "mosfet 4 off"),
+        ("Fuel Pump 1 ON",   "mosfet 5 on"),    ("Fuel Pump 1 OFF",  "mosfet 5 off"),
     ]),
     ("ANALOG / ADC", [
         ("Analog All", "analog all"),
@@ -265,8 +266,13 @@ class ECUDashboard(tk.Tk):
         self._curr_vals  = ["---"] * 2
         self._mosfet_duty= [0] * 5
         self._m_inhibit  = [False] * 5
+        # anti-bounce: no stream sync while dragging + grace period after
+        self._m_active   = [False] * 5
+        self._m_guard    = [0.0] * 5
         self._pot_pos    = 0
         self._pot_inhibit= False
+        self._pot_active = False
+        self._pot_guard  = 0.0
         self._can_rx     = 0
         self._can_last_rx= 0
 
@@ -452,6 +458,10 @@ class ECUDashboard(tk.Tk):
                           bg=SURF, fg=TEXT_DIM, troughcolor=SURF2,
                           highlightthickness=0, sliderlength=14, showvalue=False,
                           command=lambda v, idx=i, lbl=vl: self._on_slider(idx, v, lbl))
+            sl.bind("<ButtonPress-1>",
+                    lambda e, idx=i: self._on_m_press(idx))
+            sl.bind("<ButtonRelease-1>",
+                    lambda e, idx=i: self._on_m_release(idx))
             sl.pack(side="left", padx=5)
             btn = tk.Button(row, text="OFF", width=5, bg=SURF2, fg=RED,
                             font=FONT_UI, relief="flat", cursor="hand2",
@@ -515,6 +525,7 @@ class ECUDashboard(tk.Tk):
             highlightthickness=0, sliderlength=14, showvalue=False,
             command=self._on_pot_slider)
         self._pot_slider.pack(side="left", padx=8)
+        self._pot_slider.bind("<ButtonPress-1>", self._on_pot_press)
         self._pot_slider.bind("<ButtonRelease-1>", self._on_pot_release)
 
         btns = tk.Frame(c, bg=SURF)
@@ -532,11 +543,18 @@ class ECUDashboard(tk.Tk):
     def _on_pot_slider(self, value):
         self._pot_val.config(text=f"{int(float(value)):3d}")
 
+    def _on_pot_press(self, _=None):
+        self._pot_active = True
+
     def _on_pot_release(self, _=None):
+        self._pot_active = False
+        self._pot_guard = time.time() + 1.5
         if not self._pot_inhibit:
             self._quick_cmd(f"pot set {int(self._pot_slider.get())}")
 
     def _sync_pot(self, pos):
+        if self._pot_active or time.time() < self._pot_guard:
+            return
         self._pot_inhibit = True
         self._pot_pos = pos
         self._pot_slider.set(pos)
@@ -939,6 +957,15 @@ class ECUDashboard(tk.Tk):
                 if self._hist_idx < len(self._history) else "")
 
     # ── MOSFET controls ──────────────────────────────────────────────────────
+    def _on_m_press(self, idx):
+        self._m_active[idx] = True
+
+    def _on_m_release(self, idx):
+        self._m_active[idx] = False
+        self._m_guard[idx] = time.time() + 1.5
+        if not self._m_inhibit[idx]:
+            self._send_raw(f"mosfet {idx+1} duty {self._m_sliders[idx].get()}\n".encode())
+
     def _on_slider(self, idx, value, lbl):
         duty = int(float(value))
         lbl.config(text=f"{duty:2d}")
@@ -949,9 +976,13 @@ class ECUDashboard(tk.Tk):
             self._send_raw(f"mosfet {idx+1} duty {duty}\n".encode())
 
     def _toggle_m(self, idx):
+        self._m_guard[idx] = time.time() + 1.5
         self._m_sliders[idx].set(0 if self._mosfet_duty[idx] > 0 else 10)
 
     def _sync_mosfet(self, idx, duty):
+        # never fight the user's drag (or the stale lines right after it)
+        if self._m_active[idx] or time.time() < self._m_guard[idx]:
+            return
         self._m_inhibit[idx] = True
         self._mosfet_duty[idx] = duty
         self._m_sliders[idx].set(duty)

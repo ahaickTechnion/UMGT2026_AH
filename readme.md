@@ -1,8 +1,13 @@
 # UMGT ECU 2026
 
 ESP32 DevKitC-32 + ESPSheild carrier board. Firmware lives in `UMGT/src/main.ino.cpp`
-(PlatformIO, `pio run -e esp32dev`), the control GUI is `ecu_dashboard.py`
-(built to `dist/ECU_Dashboard.exe` with `build_exe.bat`).
+(PlatformIO, `pio run -e esp32dev`). Two GUIs:
+
+- `ecu_dashboard.py` → `dist/ECU_Dashboard.exe` — low-level I/O test bench
+- `engine_dashboard.py` → `dist/UMGT_Engine.exe` — **engine-run GUI**, ported
+  from the LabVIEW `umgt_7thJuly2026.vi` test stand (see `LABVIEW_ANALYSIS.md`)
+
+Build either exe: `pyinstaller --onefile --windowed --name <Name> <file>.py`.
 
 All pin assignments below are verified against the KiCad netlist
 (`UMGT/ESPSheild-KiCAD/ESPSheild.kicad_pcb`).
@@ -59,13 +64,15 @@ Firmware resets the wiper to position 0 at boot and tracks it 0–99.
 
 ## MOSFET outputs (J7–J11, 2-pin GND+signal)
 
+Verified wiring (2026-07-08):
+
 | # | Connector | GPIO | Load |
 |---|-----------|------|------|
-| 1 | J7  | 32 | Fuel pump |
-| 2 | J8  | 33 | Cooling pump |
-| 3 | J9  | 25 | Fuel solenoid |
-| 4 | J10 | 26 | Cooling solenoid |
-| 5 | J11 | 27 | Glow plug |
+| 1 | J7  | 32 | **Glow plug** (on/off) |
+| 2 | J8  | 33 | **Solenoid 2** |
+| 3 | J9  | 25 | **Solenoid 1** |
+| 4 | J10 | 26 | **Fuel pump 2** (KNF 1.4-M) |
+| 5 | J11 | 27 | **Fuel pump 1** (KNF 1.4-M) |
 
 PWM: LEDC channels 2–6 (piezo has channel 0 on its own timer), duty 0–10,
 shared frequency default 10 kHz.
@@ -138,6 +145,11 @@ can duty <-100..100>            duty command (RawCommand 1030, 50 Hz)
 can rpm <setpoint>              closed-loop RPM (RPMCommand 1031, 50 Hz)
 can brake <0-100>               regen brake = negative duty (Reversible mode)
 can stop                        stop any ESC command, send zero
+can param list                  enumerate all ESC settings (99 on microDRIVE LPi)
+can param get|set <NAME> [v]    by name — CASE-SENSITIVE (e.g. BUS_CUR_LIM)
+can param geti|seti <idx> [v]   by index (typed automatically after a read)
+can save                        persist ESC params to NVM (microDRIVE reboots itself)
+can restart                     reboot ESC (clears latched ERROR flags)
 can baud <125|250|500|1000> | can send <id> <hex bytes> | can print on|off
 mosfet all|<1-5> on|off|duty <0-10>   ·   mosfet freq <hz>
 piezo on|off|duty <0-255>|freq <hz>
@@ -150,6 +162,37 @@ stream on|off                   telemetry stream (default 10 Hz)
 stream rate <1-50>              stream rate in Hz; TCs sample at a fixed 10 Hz
                                 (MAX31855 converts internally every ~100 ms)
 ```
+
+### Engine control (ported from LabVIEW + designed sequencer)
+
+```
+eng start                       auto sequence: PRECHECK→GLOW→SPOOL→IGNITION→WARMUP→RUNNING
+eng stop                        normal shutdown: fuel+glow off → COOLDOWN spin → OFF
+eng abort | eng reset           immediate kill (latched FAULT) / clear fault
+eng manual                      manual mode (direct pump/glow/throttle, failsafes live)
+eng status | eng params         status dump / list parameters (PARAM:name=value)
+eng set <name> <value>          edit any sequence/limit/PID parameter live
+gov on|off | gov sp <rpm>       RPM governor (NI PID Advanced form, out 15-100%)
+gov gains <kc> <ti_min> <td_min>
+thr <0-100>                     manual engine throttle (slew via governor off)
+ramp up|down|pause|off          LabVIEW-style throttle ramp; ramp rate <pct/s>
+pump <1|2> <0-100>              independent KNF fuel pumps, fine PWM; pump stop
+glow on|off                     glow plug on MOSFET M1 (GPIO32)
+sol <1|2> on|off                solenoid 1 (M3/GPIO25) / 2 (M2/GPIO33)
+fuel cut on|off                 fuel shutoff latch (pumps forced to 0)
+```
+
+Failsafes (always active when anything is live, all editable):
+TIT/coil/bearing over-temp, overspeed, flameout (lit + fuel + TIT below
+floor), ESC telemetry loss, TIT thermocouple loss mid-sequence. Any trip →
+everything safe + latched FAULT.
+
+Engine stream keys: `ENG,FLT,GLW,P1,P2,FF,GOV,GSP,THR,FCUT,RMP`; state
+transitions and faults print as `ENG:STATE=…` / `ENG:FAULT=…` events.
+
+Actuators: glow=M1(32), sol2=M2(33), sol1=M3(25), pump2=M4(26), pump1=M5(27),
+ESC=DroneCAN. Sensors: TC1=TIT, TC2=glow area, TC3=bearing, TC4=coil,
+RPM/V/I from ESC.
 
 Stream line format:
 

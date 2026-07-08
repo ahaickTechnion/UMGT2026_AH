@@ -28,6 +28,17 @@
 #define SIG_ALLOCATION      0x0B2A812620A11D40ULL
 #define DNA_DEFAULT_NODE_ID 125   // handed to the ESC if it has no preference
 #define DTID_NODE_STATUS    341   // uavcan.protocol.NodeStatus (1 Hz heartbeat)
+#define DTID_ARMING_STATUS  1100  // uavcan.equipment.safety.ArmingStatus
+#define SIG_ARMING_STATUS   0x8700F375556A8003ULL
+
+// DroneCAN services (for configuring the microDRIVE over the bus)
+#define SVC_GETSET          11    // uavcan.protocol.param.GetSet
+#define SIG_SVC_GETSET      0xA7B622F939D1A4D5ULL
+#define SVC_OPCODE          10    // uavcan.protocol.param.ExecuteOpcode
+#define SIG_SVC_OPCODE      0x3B131AC5EB69D2CDULL
+#define SVC_RESTART         5     // uavcan.protocol.RestartNode
+#define SIG_SVC_RESTART     0x569E05394A3017F0ULL
+#define RESTART_MAGIC       0xACCE551B1EULL
 #define DTID_ESC_RAWCMD     1030  // uavcan.equipment.esc.RawCommand (duty)
 #define DTID_ESC_RPMCMD     1031  // uavcan.equipment.esc.RPMCommand (closed loop)
 #define DTID_ESC_STATUS     1034  // uavcan.equipment.esc.Status (10 Hz from ESC)
@@ -123,9 +134,19 @@ static uint32_t streamIntervalMs = 1000 / STREAM_DEFAULT_HZ;
 // -----------------------------------------------------------------------------
 static uint32_t mosfetFrequency = MOSFET_PWM_FREQ;
 
+// Load map per Owen (2026-07-08): M1/GPIO32=glow plug, M2/GPIO33=solenoid 2,
+// M3/GPIO25=solenoid 1, M4/GPIO26=fuel pump 2, M5/GPIO27=fuel pump 1
 static const uint8_t mosfetPins[]     = { PIN_MOSFET_A, PIN_MOSFET_B, PIN_MOSFET_C, PIN_MOSFET_D, PIN_MOSFET_E };
 static const uint8_t mosfetChannels[] = { 2, 3, 4, 5, 6 };
-static const char   *mosfetNames[]    = { "FuelPump", "CoolPump", "FuelSol", "CoolSol", "GlowPlug" };
+static const char   *mosfetNames[]    = { "GlowPlug", "Solenoid2", "Solenoid1", "FuelPump2", "FuelPump1" };
+
+// Engine actuator indices into the mosfet arrays
+#define MOSFET_IDX_GLOW   0   // GPIO32
+#define MOSFET_IDX_SOL2   1   // GPIO33
+#define MOSFET_IDX_SOL1   2   // GPIO25
+#define MOSFET_IDX_PUMP2  3   // GPIO26
+#define MOSFET_IDX_PUMP1  4   // GPIO27
+static const uint8_t pumpMosfetIdx[2] = { MOSFET_IDX_PUMP1, MOSFET_IDX_PUMP2 };
 static uint8_t mosfetDuty[5] = {0};
 
 uint32_t piezoFrequency = PWM_DEFAULT_FREQ;
@@ -224,6 +245,42 @@ static struct {
 
 static uint8_t allocTxTid = 0;   // transfer id counters per broadcast type
 static uint8_t nsTxTid    = 0;
+static uint8_t armTxTid   = 0;
+static uint8_t svcTxTid   = 0;   // service request transfer id
+
+// ESC arming. The microDRIVE has CAN_ARM_CHK_EN=1: it refuses to drive the
+// motor unless someone broadcasts uavcan.equipment.safety.ArmingStatus =
+// FULLY_ARMED within its ARM_MSG_TIMEOUT (1 s). We broadcast the current arm
+// state at 2 Hz, and while armed with no active command we stream zero duty
+// (REQ_ZERO_THR=1 wants a zero before any nonzero throttle).
+static bool escArmed = false;
+
+// ESC parameter configuration state ("can param ..." commands).
+// Enumeration and typed sets are asynchronous: send request → response
+// arrives via dcHandleServiceResponse → next action.
+static struct {
+  bool          listActive;
+  uint16_t      listIndex;
+  bool          setPending;      // waiting on a GET to learn the type
+  bool          setByIndex;      // microDRIVE ignores names — set via index
+  uint16_t      setIndex;
+  char          setName[64];
+  float         setValue;
+  bool          awaitReply;      // a service request is in flight
+  uint8_t       retries;
+  unsigned long sentMs;
+  uint8_t       lastPayload[110];  // for retry
+  uint8_t       lastLen;
+  uint8_t       lastSvc;
+} pcfg = {};
+
+// Service response reassembly (multi-frame: long param names)
+static struct {
+  bool     active;
+  uint8_t  svc, src, tid, toggleExpect, len;
+  uint16_t crc;
+  uint8_t  buf[128];
+} svcAsm = {};
 
 static const char *nodeHealthNames[] = { "OK", "WARNING", "ERROR", "CRITICAL" };
 static const char *nodeModeName(uint8_t m) {
@@ -335,6 +392,39 @@ bool     dcBroadcast(uint16_t dtid, uint64_t signature, uint8_t priority,
                      uint8_t *tidCounter, const uint8_t *payload, uint8_t len);
 void     dnaHandleRequest(const uint8_t *data, uint8_t dlc);
 void     nodeStatusTask();
+bool     dcSendTransfer(uint32_t id, uint64_t signature, uint8_t tid,
+                        const uint8_t *payload, uint8_t len);
+bool     dcSendServiceRequest(uint8_t serviceId, uint64_t signature, uint8_t destNode,
+                              const uint8_t *payload, uint8_t len);
+uint8_t  dcBuildGetSet(uint8_t *buf, uint16_t index, const char *name,
+                       uint8_t tag, int64_t ival, float fval);
+void     paramSendGet(uint16_t index, const char *name);
+void     paramSendSet(const char *name, uint8_t tag, int64_t ival, float fval);
+void     dcDecodeGetSetResponse(const uint8_t *buf, uint8_t len);
+void     dcHandleServiceResponse(uint8_t svc, const uint8_t *buf, uint8_t len);
+void     dcHandleServiceFrame(uint32_t id, const uint8_t *data, uint8_t dlc);
+void     paramTask();
+void     armingStatusTask();
+void     escSetArmed(bool armed);
+
+void     pumpSet(uint8_t idx, float pct);
+void     glowSet(bool on);
+void     solSet(uint8_t idx, bool on);
+void     handleSol(String &command, int &pos);
+void     engThrottleApply(float pct);
+float    engineFuelFlowGs();
+void     engineAllSafe();
+void     governorReset();
+void     governorTick(float dt);
+void     engineTick();
+void     engineStatusPrint();
+void     handleEng(String &command, int &pos);
+void     handleGov(String &command, int &pos);
+void     handlePump(String &command, int &pos);
+void     handleGlow(String &command, int &pos);
+void     handleRamp(String &command, int &pos);
+void     handleThr(String &command, int &pos);
+void     handleFuel(String &command, int &pos);
 
 float    analogToVolts(uint16_t raw);
 float    voltsToCurrentAmps(float volts);
@@ -370,12 +460,15 @@ void setup() {
 // -----------------------------------------------------------------------------
 void loop() {
   sensorTask();
+  engineTick();
   ecuHeartbeat();
   processSerialCommands();
   processSerial2Bridge();
   processCanRx();
   canThrottleTask();
   nodeStatusTask();
+  armingStatusTask();
+  paramTask();
   delay(1);
 }
 
@@ -437,6 +530,21 @@ void processSerialCommands() {
   }
 }
 
+// Original-case copy of the current command line. The dispatcher lowercases
+// everything, but ESC parameter names (and Serial2 payloads) are case-
+// sensitive, so handlers re-extract those tokens from here.
+static String cmdOriginalLine;
+
+String nthTokenOf(String line, int n) {
+  int p = 0;
+  String t;
+  for (int i = 0; i <= n; i++) {
+    t = getNextToken(line, p);
+    if (t.length() == 0) break;
+  }
+  return t;
+}
+
 void handleLineCommand(const String &command) {
   String line = command;
   line.trim();
@@ -445,6 +553,7 @@ void handleLineCommand(const String &command) {
   Serial.print("> ");
   Serial.println(line);
 
+  cmdOriginalLine = line;
   String working = line;
   working.toLowerCase();
   int pos = 0;
@@ -474,6 +583,22 @@ void handleLineCommand(const String &command) {
     handleI2c(working, pos);
   } else if (token == "serial2") {
     handleSerial2(working, pos);
+  } else if (token == "eng" || token == "engine") {
+    handleEng(working, pos);
+  } else if (token == "gov") {
+    handleGov(working, pos);
+  } else if (token == "pump") {
+    handlePump(working, pos);
+  } else if (token == "glow") {
+    handleGlow(working, pos);
+  } else if (token == "sol" || token == "solenoid") {
+    handleSol(working, pos);
+  } else if (token == "ramp") {
+    handleRamp(working, pos);
+  } else if (token == "thr") {
+    handleThr(working, pos);
+  } else if (token == "fuel") {
+    handleFuel(working, pos);
   } else {
     Serial.println("Unknown command. Type help for a command list.");
   }
@@ -547,10 +672,13 @@ void printHelp() {
   Serial.println("pot store                     - Store wiper position to X9C NVM");
   Serial.println("can                           - CAN status + decoded ESC telemetry");
   Serial.println("can esc                       - Show microDRIVE ESC telemetry (DroneCAN)");
+  Serial.println("can arm | can disarm          - Broadcast ArmingStatus (ESC arm check)");
   Serial.println("can duty <-100..100>          - Duty cycle command (RawCommand, 50 Hz)");
   Serial.println("can rpm <setpoint>            - Closed-loop RPM command (RPMCommand, 50 Hz)");
   Serial.println("can brake <0-100>             - Regen brake = negative duty (Reversible mode)");
   Serial.println("can stop                      - Stop any ESC command, send zero");
+  Serial.println("can param list|get <n>|set <n> <v> - Read/write ESC settings (DroneCAN)");
+  Serial.println("can save | can restart        - Persist ESC params to NVM / reboot ESC");
   Serial.println("can baud <125|250|500|1000>   - Restart CAN at new bitrate (DroneCAN=1000)");
   Serial.println("can send <id> <b0> [b1..b7]   - Send raw CAN frame (hex id + hex bytes)");
   Serial.println("can print on|off              - Toggle live printing of raw RX frames");
@@ -572,6 +700,18 @@ void printHelp() {
   Serial.println("serial2 send <text>           - Send raw text to Serial2 (Pixhawk)");
   Serial.println("serial2 baud <rate>           - Change Serial2 baud (Pixhawk telem = 57600)");
   Serial.println("serial2 hex on|off            - Hex-dump Serial2 traffic (MAVLink is binary)");
+  Serial.println("--- Engine control ---");
+  Serial.println("eng start|stop|abort|reset    - Auto sequence / cooldown / kill / clear fault");
+  Serial.println("eng manual | eng status       - Manual mode / engine status");
+  Serial.println("eng params | eng set <n> <v>  - List / edit sequence+limit parameters");
+  Serial.println("gov on|off|sp <rpm>           - RPM governor (PID -> throttle)");
+  Serial.println("gov gains <kc> <ti> <td>      - PID gains (Ti/Td in minutes, LabVIEW form)");
+  Serial.println("thr <0-100>                   - Manual engine throttle");
+  Serial.println("ramp up|down|pause|off        - Throttle ramp; ramp rate <pct/s>");
+  Serial.println("pump <1|2> <0-100>            - Fuel pump duty (fine PWM); pump stop");
+  Serial.println("glow on|off                   - Glow plug (M1/GPIO32)");
+  Serial.println("sol <1|2> on|off              - Solenoid 1 (M3/GPIO25) / 2 (M2/GPIO33)");
+  Serial.println("fuel cut on|off               - Fuel shutoff latch (pumps forced 0)");
 }
 
 void printStatus() {
@@ -775,6 +915,9 @@ void handleCan(String &command, int &pos) {
     return;
   }
 
+  if (action == "arm")    { escSetArmed(true);  return; }
+  if (action == "disarm") { escCommandStop(); escSetArmed(false); return; }
+
   if (action == "throttle" || action == "duty") {
     String value = getNextToken(command, pos);
     if (value == "off") {
@@ -860,6 +1003,93 @@ void handleCan(String &command, int &pos) {
       Serial.printf("CAN RX printing %s\n", canPrintRx ? "ON" : "OFF");
       return;
     }
+  }
+
+  if (action == "param") {
+    String sub = getNextToken(command, pos);
+    if (sub == "list") {
+      pcfg.listActive = true;
+      pcfg.listIndex = 0;
+      pcfg.setPending = false;
+      Serial.println("Listing ESC parameters...");
+      paramSendGet(0, "");
+      return;
+    }
+    if (sub == "get") {
+      String pname = getNextToken(command, pos);
+      if (pname.length() > 0) {
+        // param names are case-sensitive — take from the original line
+        String realName = nthTokenOf(cmdOriginalLine, 3);
+        pcfg.listActive = false;
+        pcfg.setPending = false;
+        paramSendGet(0, realName.c_str());
+        return;
+      }
+    }
+    if (sub == "set") {
+      String pname = getNextToken(command, pos);
+      String pval  = getNextToken(command, pos);
+      if (pname.length() > 0 && pval.length() > 0) {
+        // Read first to learn the type, then set with the matching type
+        String realName = nthTokenOf(cmdOriginalLine, 3);
+        pcfg.listActive = false;
+        pcfg.setPending = true;
+        pcfg.setByIndex = false;
+        strncpy(pcfg.setName, realName.c_str(), sizeof(pcfg.setName) - 1);
+        pcfg.setName[sizeof(pcfg.setName) - 1] = 0;
+        pcfg.setValue = pval.toFloat();
+        paramSendGet(0, realName.c_str());
+        return;
+      }
+    }
+    if (sub == "geti") {
+      String pidx = getNextToken(command, pos);
+      if (pidx.length() > 0) {
+        pcfg.listActive = false;
+        pcfg.setPending = false;
+        paramSendGet((uint16_t)pidx.toInt(), "");
+        return;
+      }
+    }
+    if (sub == "seti") {
+      String pidx = getNextToken(command, pos);
+      String pval = getNextToken(command, pos);
+      if (pidx.length() > 0 && pval.length() > 0) {
+        pcfg.listActive = false;
+        pcfg.setPending = true;
+        pcfg.setByIndex = true;
+        pcfg.setIndex = (uint16_t)pidx.toInt();
+        pcfg.setName[0] = 0;
+        pcfg.setValue = pval.toFloat();
+        paramSendGet(pcfg.setIndex, "");
+        return;
+      }
+    }
+    Serial.println("Usage: can param list | get <name> | set <name> <v> | geti <idx> | seti <idx> <v>");
+    return;
+  }
+
+  if (action == "save") {
+    // ExecuteOpcode SAVE: uint8 opcode=0 + int48 argument=0 (7 bytes)
+    uint8_t payload[7] = {0};
+    svcTxTid++;
+    pcfg.retries = 0;
+    dcSendServiceRequest(SVC_OPCODE, SIG_SVC_OPCODE,
+                         esc.seen ? esc.srcNode : DNA_DEFAULT_NODE_ID, payload, 7);
+    Serial.println("Requesting ESC parameter save to NVM...");
+    return;
+  }
+
+  if (action == "restart") {
+    // RestartNode: uint40 magic little-endian
+    uint8_t payload[5];
+    for (uint8_t i = 0; i < 5; i++) payload[i] = (uint8_t)(RESTART_MAGIC >> (8 * i));
+    svcTxTid++;
+    pcfg.retries = 0;
+    dcSendServiceRequest(SVC_RESTART, SIG_SVC_RESTART,
+                         esc.seen ? esc.srcNode : DNA_DEFAULT_NODE_ID, payload, 5);
+    Serial.println("Requesting ESC restart (clears latched errors)...");
+    return;
   }
 
   if (action == "send") {
@@ -1050,7 +1280,8 @@ void handleI2c(String &command, int &pos) {
 void handleSerial2(String &command, int &pos) {
   String action = getNextToken(command, pos);
   if (action == "send") {
-    String message = command.substring(pos);
+    // preserve case for the payload — 'pos' is valid in the original line
+    String message = cmdOriginalLine.substring(pos);
     message.trim();
     if (message.length() > 0) {
       Serial2.println(message);
@@ -1380,13 +1611,10 @@ static uint16_t dcTransferCrc(uint64_t signature, const uint8_t *payload, uint8_
   return crc;
 }
 
-// Broadcast a UAVCAN v0 message transfer as our node, handling single- and
-// multi-frame (with transfer CRC) automatically.
-bool dcBroadcast(uint16_t dtid, uint64_t signature, uint8_t priority,
-                 uint8_t *tidCounter, const uint8_t *payload, uint8_t len) {
+// Send one UAVCAN v0 transfer (any CAN ID), single- or multi-frame with CRC.
+bool dcSendTransfer(uint32_t id, uint64_t signature, uint8_t tid,
+                    const uint8_t *payload, uint8_t len) {
   if (!canOk) return false;
-  uint32_t id = ((uint32_t)priority << 24) | ((uint32_t)dtid << 8) | DC_NODE_ID_SELF;
-  uint8_t tid = (*tidCounter)++ & 0x1F;
 
   if (len <= 7) {
     twai_message_t m = {};
@@ -1423,6 +1651,31 @@ bool dcBroadcast(uint16_t dtid, uint64_t signature, uint8_t priority,
     toggle ^= 1;
   }
   return true;
+}
+
+// Broadcast a UAVCAN v0 message transfer as our node.
+bool dcBroadcast(uint16_t dtid, uint64_t signature, uint8_t priority,
+                 uint8_t *tidCounter, const uint8_t *payload, uint8_t len) {
+  uint32_t id = ((uint32_t)priority << 24) | ((uint32_t)dtid << 8) | DC_NODE_ID_SELF;
+  return dcSendTransfer(id, signature, (*tidCounter)++ & 0x1F, payload, len);
+}
+
+// Service request CAN ID: [28:24] prio, [23:16] service id, [15] request=1,
+// [14:8] destination node, [7] service flag=1, [6:0] source node.
+bool dcSendServiceRequest(uint8_t serviceId, uint64_t signature, uint8_t destNode,
+                          const uint8_t *payload, uint8_t len) {
+  uint32_t id = (24UL << 24) | ((uint32_t)serviceId << 16) | (1UL << 15) |
+                ((uint32_t)destNode << 8) | (1UL << 7) | DC_NODE_ID_SELF;
+  uint8_t tid = svcTxTid & 0x1F;
+  bool ok = dcSendTransfer(id, signature, tid, payload, len);
+  if (ok) {
+    pcfg.awaitReply = true;
+    pcfg.sentMs = millis();
+    pcfg.lastSvc = serviceId;
+    pcfg.lastLen = (uint8_t)min((int)len, (int)sizeof(pcfg.lastPayload));
+    memmove(pcfg.lastPayload, payload, pcfg.lastLen);  // may retry from same buf
+  }
+  return ok;
 }
 
 // Dynamic node ID allocation server. Requests arrive as anonymous single
@@ -1470,6 +1723,278 @@ void dnaHandleRequest(const uint8_t *data, uint8_t dlc) {
     Serial.printf("DNA: granted node ID %u (grant #%u)\n", assign, dna.grants);
   }
   dna.len = 0;
+}
+
+// -----------------------------------------------------------------------------
+// ESC parameter configuration via uavcan.protocol.param.GetSet
+// Request: uint13 index, Value{3-bit tag: 0 empty|1 int64|2 float32|3 bool|
+// 4 string}, name tail-array. Response: void5+Value, void5+Value default,
+// void6+NumericValue max, void6+NumericValue min, name. Verified vs pydronecan.
+// -----------------------------------------------------------------------------
+uint8_t dcBuildGetSet(uint8_t *buf, uint16_t index, const char *name,
+                      uint8_t tag, int64_t ival, float fval) {
+  memset(buf, 0, 12);
+  dcEncodeBits(buf, 0, 13, index);
+  dcEncodeBits(buf, 13, 3, tag);
+  uint8_t n = 2;
+  if (tag == 1) {          // int64 little-endian
+    for (uint8_t i = 0; i < 8; i++) buf[n++] = (uint8_t)((uint64_t)ival >> (8 * i));
+  } else if (tag == 2) {   // float32 little-endian
+    uint32_t u;
+    memcpy(&u, &fval, 4);
+    for (uint8_t i = 0; i < 4; i++) buf[n++] = (uint8_t)(u >> (8 * i));
+  }
+  uint8_t nameLen = (uint8_t)strlen(name);
+  memcpy(buf + n, name, nameLen);
+  return n + nameLen;
+}
+
+void paramSendGet(uint16_t index, const char *name) {
+  uint8_t payload[110];
+  uint8_t len = dcBuildGetSet(payload, index, name, 0, 0, 0);
+  svcTxTid++;
+  pcfg.retries = 0;
+  dcSendServiceRequest(SVC_GETSET, SIG_SVC_GETSET, esc.seen ? esc.srcNode : DNA_DEFAULT_NODE_ID,
+                       payload, len);
+}
+
+void paramSendSet(const char *name, uint8_t tag, int64_t ival, float fval) {
+  uint8_t payload[110];
+  uint8_t len = dcBuildGetSet(payload, 0, name, tag, ival, fval);
+  svcTxTid++;
+  pcfg.retries = 0;
+  dcSendServiceRequest(SVC_GETSET, SIG_SVC_GETSET, esc.seen ? esc.srcNode : DNA_DEFAULT_NODE_ID,
+                       payload, len);
+}
+
+// Walk a GetSet response. Returns the value/name and prints a PARAMESC line.
+void dcDecodeGetSetResponse(const uint8_t *buf, uint8_t len) {
+  uint32_t bit = 0;
+  uint16_t totalBits = (uint16_t)len * 8;
+
+  // Value (void5 + 3-bit tag + payload)
+  bit += 5;
+  uint8_t tag = (uint8_t)dcBits(buf, bit, 3);
+  bit += 3;
+  int64_t ival = 0;
+  float fval = 0;
+  char sval[32] = "";
+  bool isInt = false, isReal = false, isBool = false, isStr = false;
+  if (tag == 1) {
+    uint64_t u = 0;
+    for (uint8_t i = 0; i < 8; i++) u |= (uint64_t)buf[bit / 8 + i] << (8 * i);
+    ival = (int64_t)u;
+    bit += 64;
+    isInt = true;
+  } else if (tag == 2) {
+    uint32_t u = 0;
+    for (uint8_t i = 0; i < 4; i++) u |= (uint32_t)buf[bit / 8 + i] << (8 * i);
+    memcpy(&fval, &u, 4);
+    bit += 32;
+    isReal = true;
+  } else if (tag == 3) {
+    ival = buf[bit / 8];
+    bit += 8;
+    isBool = true;
+  } else if (tag == 4) {
+    uint8_t slen = buf[bit / 8];
+    bit += 8;
+    uint8_t cp = (uint8_t)min((int)slen, (int)sizeof(sval) - 1);
+    memcpy(sval, buf + bit / 8, cp);
+    sval[cp] = 0;
+    bit += (uint32_t)slen * 8;
+    isStr = true;
+  }
+
+  // default_value (void5 + Value) — skip
+  bit += 5;
+  uint8_t dtag = (uint8_t)dcBits(buf, bit, 3);
+  bit += 3;
+  if (dtag == 1) bit += 64;
+  else if (dtag == 2) bit += 32;
+  else if (dtag == 3) bit += 8;
+  else if (dtag == 4) { bit += 8 + (uint32_t)buf[bit / 8] * 8; }
+
+  // max_value / min_value (void6 + NumericValue: 2-bit tag)
+  float maxv = NAN, minv = NAN;
+  for (uint8_t k = 0; k < 2; k++) {
+    bit += 6;
+    uint8_t ntag = (uint8_t)dcBits(buf, bit, 2);
+    bit += 2;
+    float out = NAN;
+    if (ntag == 1) {
+      uint64_t u = 0;
+      for (uint8_t i = 0; i < 8; i++) u |= (uint64_t)buf[bit / 8 + i] << (8 * i);
+      out = (float)(int64_t)u;
+      bit += 64;
+    } else if (ntag == 2) {
+      uint32_t u = 0;
+      for (uint8_t i = 0; i < 4; i++) u |= (uint32_t)buf[bit / 8 + i] << (8 * i);
+      memcpy(&out, &u, 4);
+      bit += 32;
+    }
+    if (k == 0) maxv = out; else minv = out;
+  }
+
+  // name = remaining bytes
+  char name[96] = "";
+  if (bit / 8 < len) {
+    uint8_t nameLen = (uint8_t)min((int)(len - bit / 8), (int)sizeof(name) - 1);
+    memcpy(name, buf + bit / 8, nameLen);
+    name[nameLen] = 0;
+  }
+
+  if (name[0] == 0 && tag == 0) {
+    // empty response = end of parameter list
+    if (pcfg.listActive) {
+      pcfg.listActive = false;
+      Serial.printf("PARAMESC:END count=%u\n", pcfg.listIndex);
+    } else {
+      Serial.println("PARAMESC:NOTFOUND");
+    }
+    return;
+  }
+
+  Serial.printf("PARAMESC:%s=", name);
+  if      (isInt)  Serial.printf("%lld (int", (long long)ival);
+  else if (isReal) Serial.printf("%.4f (real", fval);
+  else if (isBool) Serial.printf("%lld (bool", (long long)ival);
+  else if (isStr)  Serial.printf("\"%s\" (string", sval);
+  else             Serial.print("<empty> (");
+  if (!isnan(minv) || !isnan(maxv)) Serial.printf(", range %.4g..%.4g", minv, maxv);
+  Serial.println(")");
+
+  // Pending typed set: we now know the parameter's type — send the real SET.
+  // The microDRIVE ignores name-based access, so sets go by index with the
+  // name we just confirmed from the GET response.
+  if (pcfg.setPending &&
+      (pcfg.setByIndex || strcmp(name, pcfg.setName) == 0)) {
+    pcfg.setPending = false;
+    uint16_t idx = pcfg.setByIndex ? pcfg.setIndex : 0;
+    const char *sname = pcfg.setByIndex ? "" : pcfg.setName;
+    uint8_t payload[110];
+    uint8_t plen;
+    if (isInt || isBool) {
+      plen = dcBuildGetSet(payload, idx, sname, isBool ? 3 : 1,
+                           (int64_t)llroundf(pcfg.setValue), 0);
+      Serial.printf("Setting %s (index %u) = %lld (%s)...\n", name, idx,
+                    (long long)llroundf(pcfg.setValue), isBool ? "bool" : "int");
+    } else if (isReal) {
+      plen = dcBuildGetSet(payload, idx, sname, 2, 0, pcfg.setValue);
+      Serial.printf("Setting %s (index %u) = %.4f (real)...\n", name, idx, pcfg.setValue);
+    } else {
+      Serial.println("Cannot set: parameter is a string/empty type");
+      return;
+    }
+    svcTxTid++;
+    pcfg.retries = 0;
+    dcSendServiceRequest(SVC_GETSET, SIG_SVC_GETSET,
+                         esc.seen ? esc.srcNode : DNA_DEFAULT_NODE_ID, payload, plen);
+    return;
+  }
+
+  // Enumeration: request the next index
+  if (pcfg.listActive) {
+    pcfg.listIndex++;
+    if (pcfg.listIndex < 200) {
+      paramSendGet(pcfg.listIndex, "");
+    } else {
+      pcfg.listActive = false;
+      Serial.println("PARAMESC:END (cap)");
+    }
+  }
+}
+
+// Handle a completed service response payload
+void dcHandleServiceResponse(uint8_t svc, const uint8_t *buf, uint8_t len) {
+  pcfg.awaitReply = false;
+  if (svc == SVC_GETSET) {
+    dcDecodeGetSetResponse(buf, len);
+    return;
+  }
+  if (svc == SVC_OPCODE) {
+    // Response: int48 argument + bool ok (bit 48)
+    bool ok = len >= 7 && ((buf[6] >> 7) & 1);
+    Serial.printf("ESC opcode result: %s\n", ok ? "OK (saved)" : "FAILED");
+    return;
+  }
+  if (svc == SVC_RESTART) {
+    bool ok = len >= 1 && ((buf[0] >> 7) & 1);
+    Serial.printf("ESC restart: %s\n", ok ? "accepted" : "rejected");
+    return;
+  }
+}
+
+// Reassemble service frames addressed to us (responses from the ESC)
+void dcHandleServiceFrame(uint32_t id, const uint8_t *data, uint8_t dlc) {
+  uint8_t svc    = (id >> 16) & 0xFF;
+  bool    isReq  = (id >> 15) & 1;
+  uint8_t dest   = (id >> 8) & 0x7F;
+  uint8_t src    = id & 0x7F;
+  if (isReq || dest != DC_NODE_ID_SELF || dlc < 1) return;
+
+  uint8_t tail   = data[dlc - 1];
+  bool    start  = tail & 0x80;
+  bool    end    = tail & 0x40;
+  uint8_t toggle = (tail >> 5) & 1;
+  uint8_t tid    = tail & 0x1F;
+  uint8_t plen   = dlc - 1;
+
+  if (start && end) {
+    dcHandleServiceResponse(svc, data, plen);
+    return;
+  }
+  if (start) {
+    if (plen < 3 || toggle != 0) return;
+    svcAsm.active = true;
+    svcAsm.svc = svc;
+    svcAsm.src = src;
+    svcAsm.tid = tid;
+    svcAsm.toggleExpect = 1;
+    svcAsm.len = 0;
+    svcAsm.crc = (uint16_t)data[0] | ((uint16_t)data[1] << 8);
+    for (uint8_t i = 2; i < plen && svcAsm.len < sizeof(svcAsm.buf); i++)
+      svcAsm.buf[svcAsm.len++] = data[i];
+    return;
+  }
+  if (!svcAsm.active || svcAsm.src != src || svcAsm.tid != tid ||
+      svcAsm.svc != svc || toggle != svcAsm.toggleExpect) {
+    svcAsm.active = false;
+    return;
+  }
+  svcAsm.toggleExpect ^= 1;
+  for (uint8_t i = 0; i < plen && svcAsm.len < sizeof(svcAsm.buf); i++)
+    svcAsm.buf[svcAsm.len++] = data[i];
+  if (end) {
+    svcAsm.active = false;
+    uint64_t sig = (svc == SVC_GETSET) ? SIG_SVC_GETSET :
+                   (svc == SVC_OPCODE) ? SIG_SVC_OPCODE : SIG_SVC_RESTART;
+    if (dcTransferCrc(sig, svcAsm.buf, svcAsm.len) == svcAsm.crc) {
+      dcHandleServiceResponse(svc, svcAsm.buf, svcAsm.len);
+    } else {
+      escCrcErrors++;
+    }
+  }
+}
+
+// Retry/timeout supervisor for in-flight service requests
+void paramTask() {
+  if (!pcfg.awaitReply) return;
+  if (millis() - pcfg.sentMs < 400) return;
+  if (pcfg.retries < 2) {
+    pcfg.retries++;
+    pcfg.sentMs = millis();
+    dcSendServiceRequest(pcfg.lastSvc,
+                         pcfg.lastSvc == SVC_GETSET ? SIG_SVC_GETSET :
+                         pcfg.lastSvc == SVC_OPCODE ? SIG_SVC_OPCODE : SIG_SVC_RESTART,
+                         esc.seen ? esc.srcNode : DNA_DEFAULT_NODE_ID,
+                         pcfg.lastPayload, pcfg.lastLen);
+    return;
+  }
+  pcfg.awaitReply = false;
+  pcfg.listActive = false;
+  pcfg.setPending = false;
+  Serial.println("PARAMESC:TIMEOUT (no response from ESC)");
 }
 
 // Broadcast our own NodeStatus at 1 Hz — required to be a well-behaved node
@@ -1539,7 +2064,10 @@ void dcDecodeEscStatusExt(const uint8_t *buf, uint8_t len, uint8_t src) {
 // UAVCAN v0 message CAN ID: [28:24]=priority [23:8]=data type id
 // [7]=service flag [6:0]=source node. Tail byte: start/end/toggle/transfer-id.
 void dcHandleFrame(uint32_t id, const uint8_t *data, uint8_t dlc) {
-  if ((id >> 7) & 1) return;                 // service frame — not interesting
+  if ((id >> 7) & 1) {                       // service frame (param responses)
+    dcHandleServiceFrame(id, data, dlc);
+    return;
+  }
   uint16_t dtid = (id >> 8) & 0xFFFF;
   uint8_t  src  = id & 0x7F;
   if (src == 0) {                            // anonymous = node has no ID yet
@@ -1668,13 +2196,38 @@ void escCommandStop() {
 }
 
 void canThrottleTask() {
-  if (escCmdMode == ESC_CMD_OFF) return;
   unsigned long now = millis();
+  if (escCmdMode == ESC_CMD_OFF) {
+    // While armed, keep a zero-throttle stream alive: satisfies the ESC's
+    // REQ_ZERO_THR check and keeps its signal watchdog fed.
+    if (escArmed && now - escCmdLastMs >= 20) {
+      escCmdLastMs = now;
+      dcSendRawCommand(0);
+    }
+    return;
+  }
   if (now - escCmdLastMs >= 20) {   // 50 Hz — ESCs failsafe if commands stop
     escCmdLastMs = now;
     if (escCmdMode == ESC_CMD_RPM) dcSendRpmCommand(escCmdValue);
     else                           dcSendRawCommand((int16_t)escCmdValue);
   }
+}
+
+// Broadcast ArmingStatus at 2 Hz (ESC arm-check timeout is 1 s)
+void armingStatusTask() {
+  static unsigned long last = 0;
+  unsigned long now = millis();
+  if (!canOk || now - last < 500) return;
+  last = now;
+  uint8_t p[1] = { (uint8_t)(escArmed ? 255 : 0) };  // FULLY_ARMED / DISARMED
+  dcBroadcast(DTID_ARMING_STATUS, SIG_ARMING_STATUS, 16, &armTxTid, p, 1);
+}
+
+void escSetArmed(bool armed) {
+  if (armed && !escArmed) escCmdLastMs = 0;   // start zero-stream immediately
+  escArmed = armed;
+  Serial.printf("ESC %s\n", armed ? "ARMED (broadcasting FULLY_ARMED + zero throttle)"
+                                  : "DISARMED");
 }
 
 void printEscTelemetry() {
@@ -1725,6 +2278,578 @@ void printEscTelemetry() {
   if (escCmdMode == ESC_CMD_RPM)        Serial.printf(" %d rpm\n", escCmdUser);
   else if (escCmdMode != ESC_CMD_OFF)   Serial.printf(" %d %%\n", escCmdUser);
   else                                  Serial.println();
+}
+
+// =============================================================================
+// ENGINE CONTROL
+// Modeled on the LabVIEW umgt_7thJuly2026.vi test stand (PID RPM governor →
+// throttle 15-100%, throttle slew limiting, ramp up/down machine, fuel shutoff)
+// plus a designed auto start/shutdown sequencer and failsafe supervisor that
+// the LabVIEW never had. All parameters editable at runtime via "eng set".
+//
+// Actuator map:  pump1 = MOSFET M1 (GPIO32),  pump2 = MOSFET M2 (GPIO33),
+//                glow plug = MOSFET M5 (GPIO27, on/off),  ESC = DroneCAN duty.
+// Sensor map:    TC1 = TIT, TC2 = glow-area (EGT), TC3 = bearing, TC4 = coil,
+//                RPM/voltage/current from ESC telemetry.
+// =============================================================================
+enum EngState : uint8_t {
+  ENG_OFF = 0, ENG_MANUAL, ENG_PRECHECK, ENG_GLOW, ENG_SPOOL,
+  ENG_IGNITION, ENG_WARMUP, ENG_RUNNING, ENG_COOLDOWN, ENG_FAULT
+};
+static const char *engStateNames[] = {
+  "OFF", "MANUAL", "PRECHECK", "GLOW", "SPOOL",
+  "IGNITION", "WARMUP", "RUNNING", "COOLDOWN", "FAULT"
+};
+
+enum EngFault : uint8_t {
+  FLT_NONE = 0, FLT_TIT_OVER, FLT_COIL_OVER, FLT_BEARING_OVER, FLT_OVERSPEED,
+  FLT_FLAMEOUT, FLT_ESC_LOSS, FLT_TC_LOSS, FLT_IGN_TIMEOUT, FLT_SPOOL_FAIL,
+  FLT_PRECHECK_FAIL, FLT_ABORT
+};
+static const char *engFaultNames[] = {
+  "NONE", "TIT_OVER", "COIL_OVER", "BEARING_OVER", "OVERSPEED",
+  "FLAMEOUT", "ESC_LOSS", "TC_LOSS", "IGN_TIMEOUT", "SPOOL_FAIL",
+  "PRECHECK_FAIL", "ABORT"
+};
+
+// Runtime-editable engine parameters ("eng params" lists, "eng set n v" edits)
+static struct {
+  float glow_temp    = 150;     // [C] glow-area temp to end preheat
+  float glow_time    = 15;      // [s] max preheat (proceed anyway after)
+  float spool_duty   = 20;      // [%] starter throttle
+  float spool_rpm    = 15000;   // [rpm] to reach before fuel
+  float spool_time   = 10;      // [s] timeout -> SPOOL_FAIL
+  float ign_pump     = 10;      // [%] pump1 duty at fuel introduction
+  float ign_ramp     = 2;       // [%/s] pump1 ramp during ignition
+  float ign_pump_max = 40;      // [%] pump1 cap during ignition
+  float lightoff_rise= 50;      // [C] TIT rise over baseline = lit
+  float ign_timeout  = 20;      // [s] no light-off -> IGN_TIMEOUT
+  float warmup_rpm   = 30000;   // [rpm] governor target after light-off
+  float glow_off_tit = 250;     // [C] TIT at which glow turns off
+  float tit_max      = 1000;    // [C] failsafe
+  float coil_max     = 120;     // [C] failsafe
+  float bearing_max  = 100;     // [C] failsafe
+  float max_rpm      = 120000;  // [rpm] overspeed failsafe + ramp guard
+  float flameout_tit = 300;     // [C] lit + fuel on + TIT below this = flameout
+  float esc_loss     = 2;       // [s] ESC telemetry age -> failsafe
+  float cool_duty    = 15;      // [%] cooldown motoring throttle
+  float cool_tit     = 100;     // [C] cooldown ends below this
+  float cool_time    = 120;     // [s] cooldown max duration
+  float pump1_cal    = 100;     // [ml/min] pump1 flow at 100%
+  float pump2_cal    = 100;     // [ml/min] pump2 flow at 100%
+  float fuel_density = 0.84;    // [g/ml] kerosene (LabVIEW constant)
+  float gov_kc       = 0.001;   // proportional gain Kc [%throttle / rpm]
+  float gov_ti       = 0.05;    // integral time Ti [min] (LabVIEW convention)
+  float gov_td       = 0.0;     // derivative time Td [min]
+  float gov_min      = 15;      // [%] PID output clamp low  (LabVIEW 15%)
+  float gov_max      = 100;     // [%] PID output clamp high (LabVIEW 100%)
+  float gov_slew     = 20;      // [%/s] throttle slew limit ("avoid glitching")
+  float ramp_rate    = 5;       // [%/s] manual ramp up/down rate
+  float batt_min     = 21.0;    // [V] battery 0%
+  float batt_max     = 25.2;    // [V] battery 100%
+} ep;
+
+struct EngParamEntry { const char *name; float *val; };
+static const EngParamEntry engParamTable[] = {
+  {"glow_temp", &ep.glow_temp}, {"glow_time", &ep.glow_time},
+  {"spool_duty", &ep.spool_duty}, {"spool_rpm", &ep.spool_rpm},
+  {"spool_time", &ep.spool_time}, {"ign_pump", &ep.ign_pump},
+  {"ign_ramp", &ep.ign_ramp}, {"ign_pump_max", &ep.ign_pump_max},
+  {"lightoff_rise", &ep.lightoff_rise}, {"ign_timeout", &ep.ign_timeout},
+  {"warmup_rpm", &ep.warmup_rpm}, {"glow_off_tit", &ep.glow_off_tit},
+  {"tit_max", &ep.tit_max}, {"coil_max", &ep.coil_max},
+  {"bearing_max", &ep.bearing_max}, {"max_rpm", &ep.max_rpm},
+  {"flameout_tit", &ep.flameout_tit}, {"esc_loss", &ep.esc_loss},
+  {"cool_duty", &ep.cool_duty}, {"cool_tit", &ep.cool_tit},
+  {"cool_time", &ep.cool_time}, {"pump1_cal", &ep.pump1_cal},
+  {"pump2_cal", &ep.pump2_cal}, {"fuel_density", &ep.fuel_density},
+  {"gov_kc", &ep.gov_kc}, {"gov_ti", &ep.gov_ti}, {"gov_td", &ep.gov_td},
+  {"gov_min", &ep.gov_min}, {"gov_max", &ep.gov_max},
+  {"gov_slew", &ep.gov_slew}, {"ramp_rate", &ep.ramp_rate},
+  {"batt_min", &ep.batt_min}, {"batt_max", &ep.batt_max},
+};
+#define ENG_PARAM_COUNT (sizeof(engParamTable) / sizeof(engParamTable[0]))
+
+// Engine state
+static EngState engState = ENG_OFF;
+static EngFault engFault = FLT_NONE;
+static unsigned long engStateMs = 0;    // state entry time
+static float  titBaseline = 0;          // TIT at fuel introduction
+static bool   engLit = false;           // light-off confirmed
+
+// Actuator state (engine-owned)
+static float  pumpPct[2] = {0, 0};      // fine 0-100% (M1, M2)
+static bool   glowOn = false;
+static bool   fuelCut = false;          // "Fuel Shut Off" — latches pumps at 0
+static float  engThrottle = 0;          // engine throttle command [%]
+
+// Governor (NI PID Advanced form: Kc, Ti [min], Td [min], derivative on PV)
+static bool   govOn = false;
+static float  govSp = 0;                // RPM setpoint
+static float  govI = 0;                 // integrator (in % output units)
+static float  govPrevPv = 0;
+
+// Manual throttle ramp (LabVIEW Ramp Up / Pause / Ramp Down)
+enum RampMode : uint8_t { RAMP_OFF = 0, RAMP_UP, RAMP_PAUSE, RAMP_DOWN };
+static uint8_t rampMode = RAMP_OFF;
+static const char *rampModeNames[] = { "OFF", "UP", "PAUSE", "DOWN" };
+
+// ---- low-level actuator helpers ---------------------------------------------
+// Fine-resolution pump PWM straight to the LEDC channel (8-bit), so fuel gets
+// 0.4% steps instead of the coarse 0-10 of the generic mosfet command.
+// Pump index 0/1 maps to physical MOSFETs M5(GPIO27) and M4(GPIO26).
+void pumpSet(uint8_t idx, float pct) {
+  if (idx > 1) return;
+  if (fuelCut) pct = 0;
+  pumpPct[idx] = constrain(pct, 0.0f, 100.0f);
+  uint8_t m = pumpMosfetIdx[idx];
+  ledcWrite(mosfetChannels[m], (uint32_t)(pumpPct[idx] * 255.0f / 100.0f));
+  mosfetDuty[m] = (uint8_t)(pumpPct[idx] / 10.0f + 0.5f);  // keep M display sane
+}
+
+void glowSet(bool on) {
+  glowOn = on;
+  setMosfetDuty(MOSFET_IDX_GLOW, on ? 10 : 0);   // M1/GPIO32, plain on/off switch
+}
+
+// Solenoids on M3(GPIO25, sol1) and M2(GPIO33, sol2). Simple on/off.
+static bool solOn[2] = { false, false };
+void solSet(uint8_t idx, bool on) {
+  if (idx > 1) return;
+  solOn[idx] = on;
+  setMosfetDuty(idx == 0 ? MOSFET_IDX_SOL1 : MOSFET_IDX_SOL2, on ? 10 : 0);
+}
+
+// Engine throttle → ESC duty command (via the existing 50 Hz DroneCAN sender)
+void engThrottleApply(float pct) {
+  engThrottle = constrain(pct, 0.0f, 100.0f);
+  if (engThrottle <= 0.01f) {
+    if (escCmdMode == ESC_CMD_DUTY && escCmdValue > 0) escCommandStop();
+    return;
+  }
+  escCmdMode  = ESC_CMD_DUTY;
+  escCmdUser  = (int32_t)(engThrottle + 0.5f);
+  escCmdValue = (int32_t)(engThrottle * 8191.0f / 100.0f);
+}
+
+float engineFuelFlowGs() {   // estimated total fuel flow [g/s], LabVIEW-style
+  float mlmin = pumpPct[0] / 100.0f * ep.pump1_cal +
+                pumpPct[1] / 100.0f * ep.pump2_cal;
+  return mlmin * ep.fuel_density / 60.0f;   // "ml/min to g/s (0.84/60)"
+}
+
+void engineAllSafe() {
+  pumpSet(0, 0);
+  pumpSet(1, 0);
+  glowSet(false);
+  solSet(0, false);
+  solSet(1, false);
+  govOn = false;
+  rampMode = RAMP_OFF;
+  engThrottle = 0;
+  escCommandStop();
+  escSetArmed(false);
+}
+
+void engEnter(EngState s) {
+  engState = s;
+  engStateMs = millis();
+  Serial.printf("ENG:STATE=%s\n", engStateNames[s]);
+}
+
+void engineFault(EngFault f) {
+  engFault = f;
+  engineAllSafe();
+  engState = ENG_FAULT;
+  engStateMs = millis();
+  Serial.printf("ENG:FAULT=%s\n", engFaultNames[f]);
+}
+
+// ---- PID governor ------------------------------------------------------------
+// u = Kc*e + (Kc/Ti)∫e dt + Kc*Td*d(-pv)/dt, Ti/Td in minutes as in LabVIEW.
+// Anti-windup by back-calculation at the clamps, derivative on PV, and a slew
+// limiter on the throttle output (the LabVIEW "limiting to avoid glitching").
+void governorReset() {
+  govI = constrain(engThrottle, ep.gov_min, ep.gov_max);  // bumpless engage
+  govPrevPv = esc.seen ? (float)esc.rpm : 0;
+}
+
+void governorTick(float dt) {
+  float pv = esc.seen ? (float)esc.rpm : 0;
+  float e  = govSp - pv;
+  float Ti = ep.gov_ti * 60.0f;
+  float Td = ep.gov_td * 60.0f;
+
+  float P = ep.gov_kc * e;
+  if (Ti > 1e-4f) govI += (ep.gov_kc / Ti) * e * dt;
+  float D = (Td > 1e-4f && dt > 1e-4f) ? -ep.gov_kc * Td * (pv - govPrevPv) / dt : 0;
+  govPrevPv = pv;
+
+  float u = P + govI + D;
+  if (u > ep.gov_max) { govI -= (u - ep.gov_max); u = ep.gov_max; }
+  if (u < ep.gov_min) { govI += (ep.gov_min - u); u = ep.gov_min; }
+
+  float maxStep = ep.gov_slew * dt;
+  float target = u;
+  if (target > engThrottle + maxStep) target = engThrottle + maxStep;
+  if (target < engThrottle - maxStep) target = engThrottle - maxStep;
+  engThrottleApply(target);
+}
+
+// ---- 20 Hz engine tick: failsafes, sequencer, governor, ramp ------------------
+void engineTick() {
+  static unsigned long lastTick = 0;
+  unsigned long now = millis();
+  if (now - lastTick < 50) return;
+  float dt = (lastTick == 0) ? 0.05f : (now - lastTick) / 1000.0f;
+  lastTick = now;
+
+  float tit     = tcTemp[0];
+  float glowT   = tcTemp[1];
+  float bearing = tcTemp[2];
+  float coil    = tcTemp[3];
+  float rpm     = esc.seen ? (float)esc.rpm : 0;
+
+  // Fuel shutoff is absolute — enforce every tick
+  if (fuelCut && (pumpPct[0] > 0 || pumpPct[1] > 0)) {
+    pumpSet(0, 0);
+    pumpSet(1, 0);
+  }
+
+  // ---- failsafe supervisor: active whenever anything is live ----
+  bool outputsLive = pumpPct[0] > 0 || pumpPct[1] > 0 || glowOn || engThrottle > 0;
+  bool seqActive   = engState >= ENG_PRECHECK && engState <= ENG_COOLDOWN;
+  if (engState != ENG_FAULT && (seqActive || outputsLive || engState == ENG_MANUAL)) {
+    if      (!isnan(tit)     && tit     >= ep.tit_max)     engineFault(FLT_TIT_OVER);
+    else if (!isnan(coil)    && coil    >= ep.coil_max)    engineFault(FLT_COIL_OVER);
+    else if (!isnan(bearing) && bearing >= ep.bearing_max) engineFault(FLT_BEARING_OVER);
+    else if (esc.seen && rpm >= ep.max_rpm)                engineFault(FLT_OVERSPEED);
+    else if (engLit && (pumpPct[0] > 0 || pumpPct[1] > 0) &&
+             !isnan(tit) && tit < ep.flameout_tit)         engineFault(FLT_FLAMEOUT);
+    else if (esc.seen && engThrottle > 0 &&
+             (now - esc.lastMs) > (unsigned long)(ep.esc_loss * 1000))
+                                                           engineFault(FLT_ESC_LOSS);
+    else if (isnan(tit) && engState >= ENG_IGNITION && engState <= ENG_RUNNING)
+                                                           engineFault(FLT_TC_LOSS);
+  }
+  if (engState == ENG_FAULT) return;
+
+  float inState = (now - engStateMs) / 1000.0f;
+
+  switch (engState) {
+    case ENG_OFF:
+    case ENG_MANUAL:
+      break;   // ramp/governor handled below
+
+    case ENG_PRECHECK:
+      if (fuelCut) { engineFault(FLT_PRECHECK_FAIL); Serial.println("ENG:precheck: fuel shutoff engaged"); break; }
+      if (isnan(tit)) { engineFault(FLT_PRECHECK_FAIL); Serial.println("ENG:precheck: TIT thermocouple invalid"); break; }
+      if (!esc.seen || (now - esc.lastMs) > 2000) { engineFault(FLT_PRECHECK_FAIL); Serial.println("ENG:precheck: no ESC telemetry"); break; }
+      escSetArmed(true);   // arm broadcast + zero-throttle stream from here on
+      glowSet(true);
+      engEnter(ENG_GLOW);
+      break;
+
+    case ENG_GLOW:
+      if ((!isnan(glowT) && glowT >= ep.glow_temp) || inState >= ep.glow_time) {
+        engThrottleApply(ep.spool_duty);
+        engEnter(ENG_SPOOL);
+      }
+      break;
+
+    case ENG_SPOOL:
+      engThrottleApply(ep.spool_duty);
+      if (rpm >= ep.spool_rpm) {
+        titBaseline = isnan(tit) ? 0 : tit;
+        pumpSet(0, ep.ign_pump);
+        engEnter(ENG_IGNITION);
+      } else if (inState >= ep.spool_time) {
+        engineFault(FLT_SPOOL_FAIL);
+      }
+      break;
+
+    case ENG_IGNITION:
+      engThrottleApply(ep.spool_duty);
+      pumpSet(0, min(pumpPct[0] + ep.ign_ramp * dt, ep.ign_pump_max));
+      if (!isnan(tit) && tit >= titBaseline + ep.lightoff_rise) {
+        engLit = true;
+        govSp = ep.warmup_rpm;
+        governorReset();
+        govOn = true;
+        engEnter(ENG_WARMUP);
+      } else if (inState >= ep.ign_timeout) {
+        engineFault(FLT_IGN_TIMEOUT);
+      }
+      break;
+
+    case ENG_WARMUP:
+      if (glowOn && !isnan(tit) && tit >= ep.glow_off_tit) glowSet(false);
+      if (fabsf(rpm - ep.warmup_rpm) <= 0.10f * ep.warmup_rpm) {
+        glowSet(false);
+        engEnter(ENG_RUNNING);
+      }
+      break;
+
+    case ENG_RUNNING:
+      break;   // governor or manual throttle, operator in charge
+
+    case ENG_COOLDOWN:
+      engThrottleApply(ep.cool_duty);
+      if ((!isnan(tit) && tit <= ep.cool_tit) || inState >= ep.cool_time) {
+        engThrottleApply(0);
+        escSetArmed(false);
+        engEnter(ENG_OFF);
+      }
+      break;
+
+    default:
+      break;
+  }
+
+  // Manual ramp machine (only when the governor isn't commanding the ESC)
+  if (rampMode != RAMP_OFF && !govOn &&
+      (engState == ENG_OFF || engState == ENG_MANUAL || engState == ENG_RUNNING)) {
+    if (rampMode == RAMP_UP) {
+      if (esc.seen && rpm >= ep.max_rpm * 0.98f) rampMode = RAMP_PAUSE;  // guard
+      else engThrottleApply(engThrottle + ep.ramp_rate * dt);
+    } else if (rampMode == RAMP_DOWN) {
+      engThrottleApply(engThrottle - ep.ramp_rate * dt);
+      if (engThrottle <= 0.01f) rampMode = RAMP_OFF;
+    }
+  }
+
+  // Governor (WARMUP always; RUNNING/MANUAL when enabled)
+  if (govOn && (engState == ENG_WARMUP || engState == ENG_RUNNING ||
+                engState == ENG_MANUAL)) {
+    governorTick(dt);
+  }
+}
+
+// ---- engine command handlers ---------------------------------------------------
+void engineStatusPrint() {
+  Serial.printf("Engine: %s", engStateNames[engState]);
+  if (engState == ENG_FAULT) Serial.printf(" (fault: %s)", engFaultNames[engFault]);
+  Serial.println();
+  Serial.printf("  throttle=%.1f%%  gov=%s sp=%.0f rpm  ramp=%s\n",
+                engThrottle, govOn ? "ON" : "off", govSp, rampModeNames[rampMode]);
+  Serial.printf("  pump1=%.1f%%  pump2=%.1f%%  fuel=%.3f g/s  glow=%s  fuelcut=%s\n",
+                pumpPct[0], pumpPct[1], engineFuelFlowGs(),
+                glowOn ? "ON" : "off", fuelCut ? "ENGAGED" : "off");
+  Serial.printf("  lit=%s  titBaseline=%.1f C\n", engLit ? "yes" : "no", titBaseline);
+}
+
+void handleEng(String &command, int &pos) {
+  String action = getNextToken(command, pos);
+
+  if (action == "start") {
+    if (engState == ENG_OFF || engState == ENG_MANUAL) {
+      engFault = FLT_NONE;
+      engLit = false;
+      engEnter(ENG_PRECHECK);
+      Serial.println("Engine auto-start sequence initiated");
+    } else {
+      Serial.printf("Cannot start from state %s\n", engStateNames[engState]);
+    }
+    return;
+  }
+  if (action == "stop") {
+    if (engState >= ENG_PRECHECK && engState <= ENG_RUNNING) {
+      pumpSet(0, 0); pumpSet(1, 0);
+      glowSet(false);
+      govOn = false;
+      engEnter(ENG_COOLDOWN);
+      Serial.println("Engine stop: cooldown started");
+    } else if (engState == ENG_MANUAL) {
+      engineAllSafe();
+      engEnter(ENG_OFF);
+    } else {
+      Serial.printf("Nothing to stop (state %s)\n", engStateNames[engState]);
+    }
+    return;
+  }
+  if (action == "abort") {
+    engineFault(FLT_ABORT);
+    return;
+  }
+  if (action == "reset") {
+    if (engState == ENG_FAULT) {
+      engFault = FLT_NONE;
+      engLit = false;
+      engEnter(ENG_OFF);
+      Serial.println("Fault cleared");
+    } else {
+      Serial.println("No fault latched");
+    }
+    return;
+  }
+  if (action == "manual") {
+    if (engState == ENG_OFF) {
+      engEnter(ENG_MANUAL);
+      Serial.println("Manual mode: pumps/glow/throttle under direct control (failsafes active)");
+    } else {
+      Serial.printf("Manual only from OFF (state %s)\n", engStateNames[engState]);
+    }
+    return;
+  }
+  if (action == "status" || action.length() == 0) {
+    engineStatusPrint();
+    return;
+  }
+  if (action == "params") {
+    for (size_t i = 0; i < ENG_PARAM_COUNT; i++) {
+      Serial.printf("PARAM:%s=%.4f\n", engParamTable[i].name, *engParamTable[i].val);
+    }
+    return;
+  }
+  if (action == "set") {
+    String pname = getNextToken(command, pos);
+    String pval  = getNextToken(command, pos);
+    if (pname.length() > 0 && pval.length() > 0) {
+      for (size_t i = 0; i < ENG_PARAM_COUNT; i++) {
+        if (pname == engParamTable[i].name) {
+          *engParamTable[i].val = pval.toFloat();
+          Serial.printf("PARAM:%s=%.4f\n", engParamTable[i].name, *engParamTable[i].val);
+          return;
+        }
+      }
+      Serial.printf("Unknown param '%s' — see 'eng params'\n", pname.c_str());
+      return;
+    }
+  }
+  Serial.println("Usage: eng start|stop|abort|reset|manual|status|params | eng set <name> <value>");
+}
+
+void handleGov(String &command, int &pos) {
+  String action = getNextToken(command, pos);
+  if (action == "on") {
+    governorReset();
+    govOn = true;
+    Serial.printf("Governor ON, setpoint %.0f rpm\n", govSp);
+    return;
+  }
+  if (action == "off") {
+    govOn = false;
+    Serial.println("Governor OFF (throttle holds last value)");
+    return;
+  }
+  if (action == "sp") {
+    String v = getNextToken(command, pos);
+    if (v.length() > 0) {
+      govSp = constrain(v.toFloat(), 0.0f, ep.max_rpm);
+      Serial.printf("Governor setpoint %.0f rpm\n", govSp);
+      return;
+    }
+  }
+  if (action == "gains") {
+    String kc = getNextToken(command, pos);
+    String ti = getNextToken(command, pos);
+    String td = getNextToken(command, pos);
+    if (kc.length() && ti.length() && td.length()) {
+      ep.gov_kc = kc.toFloat();
+      ep.gov_ti = ti.toFloat();
+      ep.gov_td = td.toFloat();
+      Serial.printf("Governor gains Kc=%.5f Ti=%.4f min Td=%.4f min\n",
+                    ep.gov_kc, ep.gov_ti, ep.gov_td);
+      return;
+    }
+  }
+  Serial.printf("Governor: %s, sp=%.0f, Kc=%.5f Ti=%.4f Td=%.4f, out %.0f-%.0f%%\n",
+                govOn ? "ON" : "off", govSp, ep.gov_kc, ep.gov_ti, ep.gov_td,
+                ep.gov_min, ep.gov_max);
+  Serial.println("Usage: gov on|off | gov sp <rpm> | gov gains <kc> <ti_min> <td_min>");
+}
+
+void handlePump(String &command, int &pos) {
+  String which = getNextToken(command, pos);
+  if (which == "stop") {
+    pumpSet(0, 0);
+    pumpSet(1, 0);
+    Serial.println("Both pumps stopped");
+    return;
+  }
+  int idx = which.toInt();
+  if (idx == 1 || idx == 2) {
+    String v = getNextToken(command, pos);
+    if (v.length() > 0) {
+      if (fuelCut) { Serial.println("FUEL SHUTOFF ENGAGED — release with 'fuel cut off'"); return; }
+      pumpSet(idx - 1, v.toFloat());
+      Serial.printf("Pump %d = %.1f%% (fuel est %.3f g/s total)\n",
+                    idx, pumpPct[idx - 1], engineFuelFlowGs());
+      return;
+    }
+  }
+  Serial.println("Usage: pump <1|2> <0-100> | pump stop");
+}
+
+void handleGlow(String &command, int &pos) {
+  String action = getNextToken(command, pos);
+  if (action == "on")  { glowSet(true);  Serial.println("Glow plug ON");  return; }
+  if (action == "off") { glowSet(false); Serial.println("Glow plug OFF"); return; }
+  Serial.printf("Glow plug is %s (usage: glow on|off)\n", glowOn ? "ON" : "OFF");
+}
+
+// Solenoid 1 = M3/GPIO25, solenoid 2 = M2/GPIO33
+void handleSol(String &command, int &pos) {
+  String which = getNextToken(command, pos);
+  int idx = which.toInt();
+  if (idx == 1 || idx == 2) {
+    String action = getNextToken(command, pos);
+    if (action == "on")  { solSet(idx - 1, true);  Serial.printf("Solenoid %d ON\n", idx);  return; }
+    if (action == "off") { solSet(idx - 1, false); Serial.printf("Solenoid %d OFF\n", idx); return; }
+  }
+  Serial.printf("Solenoids: 1=%s 2=%s (usage: sol <1|2> on|off)\n",
+                solOn[0] ? "ON" : "OFF", solOn[1] ? "ON" : "OFF");
+}
+
+void handleRamp(String &command, int &pos) {
+  String action = getNextToken(command, pos);
+  if (action == "up")    { rampMode = RAMP_UP;    Serial.println("Ramp UP");    return; }
+  if (action == "down")  { rampMode = RAMP_DOWN;  Serial.println("Ramp DOWN");  return; }
+  if (action == "pause") { rampMode = RAMP_PAUSE; Serial.println("Ramp PAUSE"); return; }
+  if (action == "off")   { rampMode = RAMP_OFF;   Serial.println("Ramp OFF");   return; }
+  if (action == "rate") {
+    String v = getNextToken(command, pos);
+    if (v.length() > 0) {
+      ep.ramp_rate = constrain(v.toFloat(), 0.1f, 50.0f);
+      Serial.printf("Ramp rate %.1f %%/s\n", ep.ramp_rate);
+      return;
+    }
+  }
+  Serial.printf("Ramp: %s at %.1f %%/s (usage: ramp up|down|pause|off | ramp rate <pct/s>)\n",
+                rampModeNames[rampMode], ep.ramp_rate);
+}
+
+void handleThr(String &command, int &pos) {
+  String v = getNextToken(command, pos);
+  if (v.length() > 0) {
+    if (govOn) { Serial.println("Governor is ON — 'gov off' first for manual throttle"); return; }
+    rampMode = RAMP_OFF;
+    engThrottleApply(v.toFloat());
+    Serial.printf("Throttle %.1f%%\n", engThrottle);
+    return;
+  }
+  Serial.printf("Throttle %.1f%% (usage: thr <0-100>)\n", engThrottle);
+}
+
+void handleFuel(String &command, int &pos) {
+  String action = getNextToken(command, pos);
+  if (action == "cut") {
+    String v = getNextToken(command, pos);
+    if (v == "on") {
+      fuelCut = true;
+      pumpSet(0, 0);
+      pumpSet(1, 0);
+      Serial.println("FUEL SHUTOFF ENGAGED — pumps forced to 0");
+      return;
+    }
+    if (v == "off") {
+      fuelCut = false;
+      Serial.println("Fuel shutoff released");
+      return;
+    }
+  }
+  Serial.printf("Fuel: cut=%s, flow est %.3f g/s (usage: fuel cut on|off)\n",
+                fuelCut ? "ENGAGED" : "off", engineFuelFlowGs());
 }
 
 // -----------------------------------------------------------------------------
@@ -1798,7 +2923,16 @@ void sendStreamData() {
   } else if (esc.seen) {
     Serial.print("ESC_LOST=1,");
   }
-  Serial.printf("ESC_CMODE=%s,ESC_CVAL=%d,", escCmdModeNames[escCmdMode], escCmdUser);
+  Serial.printf("ESC_CMODE=%s,ESC_CVAL=%d,ARM=%d,",
+                escCmdModeNames[escCmdMode], escCmdUser, escArmed ? 1 : 0);
+
+  // Engine control state
+  Serial.printf("ENG=%s,FLT=%s,GLW=%d,P1=%.1f,P2=%.1f,FF=%.3f,",
+                engStateNames[engState], engFaultNames[engFault],
+                glowOn ? 1 : 0, pumpPct[0], pumpPct[1], engineFuelFlowGs());
+  Serial.printf("GOV=%d,GSP=%.0f,THR=%.1f,FCUT=%d,RMP=%s,SOL1=%d,SOL2=%d,",
+                govOn ? 1 : 0, govSp, engThrottle, fuelCut ? 1 : 0,
+                rampModeNames[rampMode], solOn[0] ? 1 : 0, solOn[1] ? 1 : 0);
 
   for (uint8_t i = 0; i < 5; i++) {
     Serial.printf("M%u=%u", i + 1, mosfetDuty[i]);
@@ -1881,17 +3015,30 @@ bool expanderRecover() {
   return expanderOk;
 }
 
-// PCF8575 answers at 0x20-0x27 depending on the A0-A2 solder pads.
-// Try the default first, then hunt for it so a re-jumpered module still works.
-void expanderDetect() {
-  for (uint8_t addr = 0x20; addr <= 0x27; addr++) {
+// A noise glitch can fake a single I2C ACK, so never trust one: require two
+// consecutive ACKs before believing a device lives at an address.
+static bool i2cProbe2(uint8_t addr) {
+  for (uint8_t k = 0; k < 2; k++) {
     Wire.beginTransmission(addr);
-    if (Wire.endTransmission() == 0) {
+    if (Wire.endTransmission() != 0) return false;
+  }
+  return true;
+}
+
+// PCF8575 answers at 0x20-0x27 depending on the A0-A2 solder pads. Its address
+// can never change at runtime, so strongly prefer the last-known-good one —
+// switching to a phantom address kills every CS line until the next recovery.
+void expanderDetect() {
+  if (i2cProbe2(expanderAddr)) {
+    expanderOk = true;
+    return;
+  }
+  for (uint8_t addr = 0x20; addr <= 0x27; addr++) {
+    if (addr == expanderAddr) continue;
+    if (i2cProbe2(addr)) {
       expanderAddr = addr;
       expanderOk = true;
-      if (addr != I2C_EXPANDER_ADDR) {
-        Serial.printf("PCF8575 found at 0x%02X (not default 0x20)\n", addr);
-      }
+      Serial.printf("PCF8575 found at 0x%02X\n", addr);
       return;
     }
   }
