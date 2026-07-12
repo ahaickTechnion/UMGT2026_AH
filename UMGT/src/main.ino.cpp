@@ -2,6 +2,7 @@
 #include <Wire.h>
 #include <SPI.h>
 #include <math.h>
+#include <Preferences.h>
 #include "driver/twai.h"
 
 // -----------------------------------------------------------------------------
@@ -411,6 +412,9 @@ void     pumpSet(uint8_t idx, float pct);
 void     glowSet(bool on);
 void     solSet(uint8_t idx, bool on);
 void     handleSol(String &command, int &pos);
+void     engineParamsSave();
+bool     engineParamsLoad();
+void     engineParamsClear();
 void     engThrottleApply(float pct);
 float    engineFuelFlowGs();
 void     engineAllSafe();
@@ -448,6 +452,9 @@ void setup() {
   initializeBuses();
   initializeCan();
   initializeTestController();
+
+  if (engineParamsLoad())
+    Serial.println("Engine parameters loaded from flash");
 
   Serial.println("ECU boot complete");
   Serial.printf("ESP32 WROOM-32 ECU starting, debug %u baud\n", DEBUG_BAUD);
@@ -704,6 +711,7 @@ void printHelp() {
   Serial.println("eng start|stop|abort|reset    - Auto sequence / cooldown / kill / clear fault");
   Serial.println("eng manual | eng status       - Manual mode / engine status");
   Serial.println("eng params | eng set <n> <v>  - List / edit sequence+limit parameters");
+  Serial.println("eng save | eng defaults       - Persist params to ECU flash / clear saved");
   Serial.println("gov on|off|sp <rpm>           - RPM governor (PID -> throttle)");
   Serial.println("gov gains <kc> <ti> <td>      - PID gains (Ti/Td in minutes, LabVIEW form)");
   Serial.println("thr <0-100>                   - Manual engine throttle");
@@ -2370,6 +2378,39 @@ static const EngParamEntry engParamTable[] = {
 };
 #define ENG_PARAM_COUNT (sizeof(engParamTable) / sizeof(engParamTable[0]))
 
+// Non-volatile storage for engine params (survives ESP32 reboot/power-cycle).
+// "eng save" writes here; loaded automatically at boot. All param names are
+// <= 13 chars, within the 15-char NVS key limit.
+static Preferences enginePrefs;
+
+void engineParamsSave() {
+  enginePrefs.begin("engparams", false);
+  for (size_t i = 0; i < ENG_PARAM_COUNT; i++)
+    enginePrefs.putFloat(engParamTable[i].name, *engParamTable[i].val);
+  enginePrefs.putBool("_saved", true);
+  enginePrefs.end();
+  Serial.println("Engine parameters saved to ECU flash (survives reboot)");
+}
+
+bool engineParamsLoad() {
+  enginePrefs.begin("engparams", true);   // read-only
+  bool saved = enginePrefs.getBool("_saved", false);
+  if (saved) {
+    for (size_t i = 0; i < ENG_PARAM_COUNT; i++)
+      *engParamTable[i].val =
+          enginePrefs.getFloat(engParamTable[i].name, *engParamTable[i].val);
+  }
+  enginePrefs.end();
+  return saved;
+}
+
+void engineParamsClear() {
+  enginePrefs.begin("engparams", false);
+  enginePrefs.clear();
+  enginePrefs.end();
+  Serial.println("Saved engine parameters cleared — code defaults on next boot");
+}
+
 // Engine state
 static EngState engState = ENG_OFF;
 static EngFault engFault = FLT_NONE;
@@ -2701,6 +2742,15 @@ void handleEng(String &command, int &pos) {
     }
     return;
   }
+  if (action == "save") {
+    engineParamsSave();
+    return;
+  }
+  if (action == "defaults") {
+    engineParamsClear();
+    Serial.println("Reboot the ECU to apply code defaults");
+    return;
+  }
   if (action == "set") {
     String pname = getNextToken(command, pos);
     String pval  = getNextToken(command, pos);
@@ -2716,7 +2766,7 @@ void handleEng(String &command, int &pos) {
       return;
     }
   }
-  Serial.println("Usage: eng start|stop|abort|reset|manual|status|params | eng set <name> <value>");
+  Serial.println("Usage: eng start|stop|abort|reset|manual|status|params|save|defaults | eng set <name> <value>");
 }
 
 void handleGov(String &command, int &pos) {
