@@ -409,6 +409,8 @@ void     armingStatusTask();
 void     escSetArmed(bool armed);
 
 void     pumpSet(uint8_t idx, float pct);
+float    pctToFlow(float pct);
+float    pumpPctForFlow(float mlmin);
 void     glowSet(bool on);
 void     solSet(uint8_t idx, bool on);
 void     handleSol(String &command, int &pos);
@@ -416,6 +418,7 @@ void     engineParamsSave();
 bool     engineParamsLoad();
 void     engineParamsClear();
 void     engThrottleApply(float pct);
+float    engineFuelFlowMlMin();
 float    engineFuelFlowGs();
 void     engineAllSafe();
 void     governorReset();
@@ -433,6 +436,9 @@ void     handleFuel(String &command, int &pos);
 float    analogToVolts(uint16_t raw);
 float    voltsToCurrentAmps(float volts);
 float    readCurrentAmps(uint8_t pin);
+void     currentSensorTask();
+float    currentSmoothVolts(uint8_t idx);
+float    currentSmoothAmps(uint8_t idx);
 
 void printAnalogValue(uint8_t pin, const char *name);
 void sendStreamData();
@@ -467,6 +473,7 @@ void setup() {
 // -----------------------------------------------------------------------------
 void loop() {
   sensorTask();
+  currentSensorTask();
   engineTick();
   ecuHeartbeat();
   processSerialCommands();
@@ -823,16 +830,16 @@ void handleCurrent(String &command, int &pos) {
   String input = getNextToken(command, pos);
 
   if (input == "all") {
-    Serial.printf("A (Battery/34): %.3f A\n", readCurrentAmps(PIN_ANALOG_A));
-    Serial.printf("B (Load/35):    %.3f A\n", readCurrentAmps(PIN_ANALOG_B));
+    Serial.printf("A (34): %.3f A  (%.3f V)\n", currentSmoothAmps(0), currentSmoothVolts(0));
+    Serial.printf("B (35): %.3f A  (%.3f V)\n", currentSmoothAmps(1), currentSmoothVolts(1));
     return;
   }
   if (input == "a") {
-    Serial.printf("A (Battery/34): %.3f A\n", readCurrentAmps(PIN_ANALOG_A));
+    Serial.printf("A (34): %.3f A  (%.3f V)\n", currentSmoothAmps(0), currentSmoothVolts(0));
     return;
   }
   if (input == "b") {
-    Serial.printf("B (Load/35): %.3f A\n", readCurrentAmps(PIN_ANALOG_B));
+    Serial.printf("B (35): %.3f A  (%.3f V)\n", currentSmoothAmps(1), currentSmoothVolts(1));
     return;
   }
   if (input == "cal") {
@@ -2327,10 +2334,10 @@ static struct {
   float spool_duty   = 20;      // [%] starter throttle
   float spool_rpm    = 15000;   // [rpm] to reach before fuel
   float spool_time   = 10;      // [s] timeout -> SPOOL_FAIL
-  float ign_pump     = 10;      // [%] pump1 duty at fuel introduction
-  float ign_ramp     = 2;       // [%/s] pump1 ramp during ignition
-  float ign_pump_max = 40;      // [%] pump1 cap during ignition
-  float lightoff_rise= 50;      // [C] TIT rise over baseline = lit
+  float ign_pump     = 2;       // [ml/min] pump1 fuel flow at introduction
+  float ign_ramp     = 0.5;     // [ml/min/s] pump1 fuel ramp during ignition
+  float ign_pump_max = 8;       // [ml/min] pump1 fuel cap during ignition
+  float lightoff_tit = 230;     // [C] absolute TIT at which light-off declared
   float ign_timeout  = 20;      // [s] no light-off -> IGN_TIMEOUT
   float warmup_rpm   = 30000;   // [rpm] governor target after light-off
   float glow_off_tit = 250;     // [C] TIT at which glow turns off
@@ -2355,6 +2362,7 @@ static struct {
   float ramp_rate    = 5;       // [%/s] manual ramp up/down rate
   float batt_min     = 21.0;    // [V] battery 0%
   float batt_max     = 25.2;    // [V] battery 100%
+  float sol_duty     = 88;      // [%] PWM for solenoid "on" (50% of 12V ~= 6V)
 } ep;
 
 struct EngParamEntry { const char *name; float *val; };
@@ -2363,7 +2371,7 @@ static const EngParamEntry engParamTable[] = {
   {"spool_duty", &ep.spool_duty}, {"spool_rpm", &ep.spool_rpm},
   {"spool_time", &ep.spool_time}, {"ign_pump", &ep.ign_pump},
   {"ign_ramp", &ep.ign_ramp}, {"ign_pump_max", &ep.ign_pump_max},
-  {"lightoff_rise", &ep.lightoff_rise}, {"ign_timeout", &ep.ign_timeout},
+  {"lightoff_tit", &ep.lightoff_tit}, {"ign_timeout", &ep.ign_timeout},
   {"warmup_rpm", &ep.warmup_rpm}, {"glow_off_tit", &ep.glow_off_tit},
   {"tit_max", &ep.tit_max}, {"coil_max", &ep.coil_max},
   {"bearing_max", &ep.bearing_max}, {"max_rpm", &ep.max_rpm},
@@ -2375,6 +2383,7 @@ static const EngParamEntry engParamTable[] = {
   {"gov_min", &ep.gov_min}, {"gov_max", &ep.gov_max},
   {"gov_slew", &ep.gov_slew}, {"ramp_rate", &ep.ramp_rate},
   {"batt_min", &ep.batt_min}, {"batt_max", &ep.batt_max},
+  {"sol_duty", &ep.sol_duty},
 };
 #define ENG_PARAM_COUNT (sizeof(engParamTable) / sizeof(engParamTable[0]))
 
@@ -2448,17 +2457,64 @@ void pumpSet(uint8_t idx, float pct) {
   mosfetDuty[m] = (uint8_t)(pumpPct[idx] / 10.0f + 0.5f);  // keep M display sane
 }
 
+// Fuel pump flow calibration — Hausl ZP25M14F gear pump (positive displacement).
+// Measured (duty %, flow ml/min), monotonic. This pump has a hard DEADBAND: no
+// flow below ~28%, then it jumps to ~57 ml/min at 29%. So there is no continuous
+// flow between 0 and ~57 ml/min — that range needs pump pulsing, not PWM level.
+#define PUMP_CAL_N 9
+static const float pumpCalPct[PUMP_CAL_N]  = { 0,  28,  29,   31,   33,   35,   38,    40,    50 };
+static const float pumpCalFlow[PUMP_CAL_N] = { 0,   0,  57.6, 67.4, 81.1, 93.5, 104.5, 126.2, 210.2 };
+
+// duty % → ml/min (forward interpolation; extrapolate above the top point)
+float pctToFlow(float pct) {
+  if (pct <= pumpCalPct[0]) return pumpCalFlow[0];
+  for (int i = 1; i < PUMP_CAL_N; i++) {
+    if (pct <= pumpCalPct[i]) {
+      float f = (pct - pumpCalPct[i - 1]) / (pumpCalPct[i] - pumpCalPct[i - 1]);
+      return pumpCalFlow[i - 1] + f * (pumpCalFlow[i] - pumpCalFlow[i - 1]);
+    }
+  }
+  float slope = (pumpCalFlow[PUMP_CAL_N - 1] - pumpCalFlow[PUMP_CAL_N - 2]) /
+                (pumpCalPct[PUMP_CAL_N - 1] - pumpCalPct[PUMP_CAL_N - 2]);
+  return pumpCalFlow[PUMP_CAL_N - 1] + slope * (pct - pumpCalPct[PUMP_CAL_N - 1]);
+}
+
+// ml/min → duty % (inverse interpolation on the calibration curve).
+// A request below the pump's minimum deliverable flow (~57 ml/min) can't be
+// honored continuously; we return the minimum-flow duty so the pump at least
+// runs (it will overshoot — the operator must know the pump's floor).
+float pumpPctForFlow(float mlmin) {
+  if (mlmin <= 0) return 0;
+  for (int i = 1; i < PUMP_CAL_N; i++) {
+    if (mlmin <= pumpCalFlow[i]) {
+      if (pumpCalFlow[i] <= pumpCalFlow[i - 1]) return pumpCalPct[i];  // deadband edge
+      float f = (mlmin - pumpCalFlow[i - 1]) / (pumpCalFlow[i] - pumpCalFlow[i - 1]);
+      return constrain(pumpCalPct[i - 1] + f * (pumpCalPct[i] - pumpCalPct[i - 1]),
+                       0.0f, 100.0f);
+    }
+  }
+  float slope = (pumpCalPct[PUMP_CAL_N - 1] - pumpCalPct[PUMP_CAL_N - 2]) /
+                (pumpCalFlow[PUMP_CAL_N - 1] - pumpCalFlow[PUMP_CAL_N - 2]);
+  return constrain(pumpCalPct[PUMP_CAL_N - 1] + slope * (mlmin - pumpCalFlow[PUMP_CAL_N - 1]),
+                   0.0f, 100.0f);
+}
+
 void glowSet(bool on) {
   glowOn = on;
   setMosfetDuty(MOSFET_IDX_GLOW, on ? 10 : 0);   // M1/GPIO32, plain on/off switch
 }
 
-// Solenoids on M3(GPIO25, sol1) and M2(GPIO33, sol2). Simple on/off.
+// Solenoids on M3(GPIO25, sol1) and M2(GPIO33, sol2). "On" drives sol_duty%
+// PWM (default 50% ~= 6V on a 12V bus) — the 10kHz carrier averages through
+// the coil inductance so the solenoid sees ~6V. Tune sol_duty to hit exactly.
 static bool solOn[2] = { false, false };
 void solSet(uint8_t idx, bool on) {
   if (idx > 1) return;
   solOn[idx] = on;
-  setMosfetDuty(idx == 0 ? MOSFET_IDX_SOL1 : MOSFET_IDX_SOL2, on ? 10 : 0);
+  uint8_t m = (idx == 0) ? MOSFET_IDX_SOL1 : MOSFET_IDX_SOL2;
+  float pct = on ? constrain(ep.sol_duty, 0.0f, 100.0f) : 0.0f;
+  ledcWrite(mosfetChannels[m], (uint32_t)(pct * 255.0f / 100.0f));
+  mosfetDuty[m] = (uint8_t)(pct / 10.0f + 0.5f);   // keep M display sane
 }
 
 // Engine throttle → ESC duty command (via the existing 50 Hz DroneCAN sender)
@@ -2473,10 +2529,12 @@ void engThrottleApply(float pct) {
   escCmdValue = (int32_t)(engThrottle * 8191.0f / 100.0f);
 }
 
-float engineFuelFlowGs() {   // estimated total fuel flow [g/s], LabVIEW-style
-  float mlmin = pumpPct[0] / 100.0f * ep.pump1_cal +
-                pumpPct[1] / 100.0f * ep.pump2_cal;
-  return mlmin * ep.fuel_density / 60.0f;   // "ml/min to g/s (0.84/60)"
+float engineFuelFlowMlMin() {   // estimated total fuel flow [ml/min]
+  return pctToFlow(pumpPct[0]) + pctToFlow(pumpPct[1]);   // per-pump curve
+}
+
+float engineFuelFlowGs() {   // [g/s] if ever needed (density from fuel_density)
+  return engineFuelFlowMlMin() * ep.fuel_density / 60.0f;
 }
 
 void engineAllSafe() {
@@ -2602,17 +2660,21 @@ void engineTick() {
       engThrottleApply(ep.spool_duty);
       if (rpm >= ep.spool_rpm) {
         titBaseline = isnan(tit) ? 0 : tit;
-        pumpSet(0, ep.ign_pump);
+        pumpSet(0, pumpPctForFlow(ep.ign_pump));   // ign_pump is ml/min
         engEnter(ENG_IGNITION);
       } else if (inState >= ep.spool_time) {
         engineFault(FLT_SPOOL_FAIL);
       }
       break;
 
-    case ENG_IGNITION:
+    case ENG_IGNITION: {
       engThrottleApply(ep.spool_duty);
-      pumpSet(0, min(pumpPct[0] + ep.ign_ramp * dt, ep.ign_pump_max));
-      if (!isnan(tit) && tit >= titBaseline + ep.lightoff_rise) {
+      // ramp fuel flow in ml/min, capped at ign_pump_max (ml/min)
+      float curFlow = pumpPct[0] / 100.0f * ep.pump1_cal;
+      float newFlow = min(curFlow + ep.ign_ramp * dt, ep.ign_pump_max);
+      pumpSet(0, pumpPctForFlow(newFlow));
+      // absolute light-off: TIT reaches lightoff_tit
+      if (!isnan(tit) && tit >= ep.lightoff_tit) {
         engLit = true;
         govSp = ep.warmup_rpm;
         governorReset();
@@ -2622,6 +2684,7 @@ void engineTick() {
         engineFault(FLT_IGN_TIMEOUT);
       }
       break;
+    }
 
     case ENG_WARMUP:
       if (glowOn && !isnan(tit) && tit >= ep.glow_off_tit) glowSet(false);
@@ -2673,8 +2736,8 @@ void engineStatusPrint() {
   Serial.println();
   Serial.printf("  throttle=%.1f%%  gov=%s sp=%.0f rpm  ramp=%s\n",
                 engThrottle, govOn ? "ON" : "off", govSp, rampModeNames[rampMode]);
-  Serial.printf("  pump1=%.1f%%  pump2=%.1f%%  fuel=%.3f g/s  glow=%s  fuelcut=%s\n",
-                pumpPct[0], pumpPct[1], engineFuelFlowGs(),
+  Serial.printf("  pump1=%.1f%%  pump2=%.1f%%  fuel=%.1f ml/min  glow=%s  fuelcut=%s\n",
+                pumpPct[0], pumpPct[1], engineFuelFlowMlMin(),
                 glowOn ? "ON" : "off", fuelCut ? "ENGAGED" : "off");
   Serial.printf("  lit=%s  titBaseline=%.1f C\n", engLit ? "yes" : "no", titBaseline);
 }
@@ -2823,8 +2886,8 @@ void handlePump(String &command, int &pos) {
     if (v.length() > 0) {
       if (fuelCut) { Serial.println("FUEL SHUTOFF ENGAGED — release with 'fuel cut off'"); return; }
       pumpSet(idx - 1, v.toFloat());
-      Serial.printf("Pump %d = %.1f%% (fuel est %.3f g/s total)\n",
-                    idx, pumpPct[idx - 1], engineFuelFlowGs());
+      Serial.printf("Pump %d = %.1f%% (fuel est %.1f ml/min total)\n",
+                    idx, pumpPct[idx - 1], engineFuelFlowMlMin());
       return;
     }
   }
@@ -2847,8 +2910,8 @@ void handleSol(String &command, int &pos) {
     if (action == "on")  { solSet(idx - 1, true);  Serial.printf("Solenoid %d ON\n", idx);  return; }
     if (action == "off") { solSet(idx - 1, false); Serial.printf("Solenoid %d OFF\n", idx); return; }
   }
-  Serial.printf("Solenoids: 1=%s 2=%s (usage: sol <1|2> on|off)\n",
-                solOn[0] ? "ON" : "OFF", solOn[1] ? "ON" : "OFF");
+  Serial.printf("Solenoids: 1=%s 2=%s, on-duty=%.0f%% (usage: sol <1|2> on|off)\n",
+                solOn[0] ? "ON" : "OFF", solOn[1] ? "ON" : "OFF", ep.sol_duty);
 }
 
 void handleRamp(String &command, int &pos) {
@@ -2898,8 +2961,8 @@ void handleFuel(String &command, int &pos) {
       return;
     }
   }
-  Serial.printf("Fuel: cut=%s, flow est %.3f g/s (usage: fuel cut on|off)\n",
-                fuelCut ? "ENGAGED" : "off", engineFuelFlowGs());
+  Serial.printf("Fuel: cut=%s, flow est %.1f ml/min (usage: fuel cut on|off)\n",
+                fuelCut ? "ENGAGED" : "off", engineFuelFlowMlMin());
 }
 
 // -----------------------------------------------------------------------------
@@ -2919,6 +2982,31 @@ float readCurrentAmps(uint8_t pin) {
   for (uint8_t i = 0; i < 8; i++) sum += analogRead(pin);
   return voltsToCurrentAmps(analogToVolts(sum / 8));
 }
+
+// Smoothed current-sensor channels (GPIO34=idx0, GPIO35=idx1). Small currents
+// on a 100 A sensor land in the ESP32 ADC's noise floor, so we sample fast and
+// low-pass filter the *voltage* (amps derived on demand, so a live cal change
+// applies instantly). This kills the flicker without adding lag you'd notice.
+static float curSmoothV[2] = { 0, 0 };
+static bool  curSmoothInit[2] = { false, false };
+
+void currentSensorTask() {
+  static unsigned long last = 0;
+  unsigned long now = millis();
+  if (now - last < 20) return;   // 50 Hz sampling
+  last = now;
+  const uint8_t pins[2] = { PIN_ANALOG_A, PIN_ANALOG_B };
+  for (uint8_t i = 0; i < 2; i++) {
+    uint32_t sum = 0;
+    for (uint8_t k = 0; k < 16; k++) sum += analogRead(pins[i]);
+    float v = analogToVolts(sum / 16);
+    if (!curSmoothInit[i]) { curSmoothV[i] = v; curSmoothInit[i] = true; }
+    else curSmoothV[i] += 0.12f * (v - curSmoothV[i]);   // EMA, ~0.15 s settle
+  }
+}
+
+float currentSmoothVolts(uint8_t idx) { return curSmoothV[idx & 1]; }
+float currentSmoothAmps(uint8_t idx)  { return voltsToCurrentAmps(curSmoothV[idx & 1]); }
 
 // -----------------------------------------------------------------------------
 // Stream data sender
@@ -2946,8 +3034,9 @@ void sendStreamData() {
     Serial.print(",");
   }
 
-  Serial.printf("I_A=%.3f,", readCurrentAmps(PIN_ANALOG_A));
-  Serial.printf("I_B=%.3f,", readCurrentAmps(PIN_ANALOG_B));
+  // smoothed amps + raw pin volts (raw volts still handy for diagnosing)
+  Serial.printf("I_A=%.3f,I_AV=%.3f,", currentSmoothAmps(0), currentSmoothVolts(0));
+  Serial.printf("I_B=%.3f,I_BV=%.3f,", currentSmoothAmps(1), currentSmoothVolts(1));
   Serial.printf("AVP=%.3f,", analogToVolts(analogRead(PIN_ANALOG_VP)));
   Serial.printf("AVN=%.3f,", analogToVolts(analogRead(PIN_ANALOG_VN)));
   Serial.printf("POT=%d,", potPosition);
@@ -2977,9 +3066,9 @@ void sendStreamData() {
                 escCmdModeNames[escCmdMode], escCmdUser, escArmed ? 1 : 0);
 
   // Engine control state
-  Serial.printf("ENG=%s,FLT=%s,GLW=%d,P1=%.1f,P2=%.1f,FF=%.3f,",
+  Serial.printf("ENG=%s,FLT=%s,GLW=%d,P1=%.1f,P2=%.1f,FF=%.1f,",
                 engStateNames[engState], engFaultNames[engFault],
-                glowOn ? 1 : 0, pumpPct[0], pumpPct[1], engineFuelFlowGs());
+                glowOn ? 1 : 0, pumpPct[0], pumpPct[1], engineFuelFlowMlMin());
   Serial.printf("GOV=%d,GSP=%.0f,THR=%.1f,FCUT=%d,RMP=%s,SOL1=%d,SOL2=%d,",
                 govOn ? 1 : 0, govSp, engThrottle, fuelCut ? 1 : 0,
                 rampModeNames[rampMode], solOn[0] ? 1 : 0, solOn[1] ? 1 : 0);
