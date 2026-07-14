@@ -4,6 +4,7 @@
 #include <math.h>
 #include <Preferences.h>
 #include "driver/twai.h"
+#include "esp_system.h"
 
 // -----------------------------------------------------------------------------
 // Pin map — verified against ESPSheild-KiCAD netlist (J1/J2 DevKitC-32 headers)
@@ -452,8 +453,29 @@ bool expanderRecover();
 // -----------------------------------------------------------------------------
 // Setup
 // -----------------------------------------------------------------------------
+// Human-readable reset reason. A BROWNOUT here across power events = the ESP32
+// is losing power (load switching / ground bounce / weak supply), which takes
+// down thermocouples, CAN and MOSFET drive all at once.
+static const char *resetReasonName() {
+  switch (esp_reset_reason()) {
+    case ESP_RST_POWERON:   return "POWER-ON (clean)";
+    case ESP_RST_EXT:       return "EXTERNAL";
+    case ESP_RST_SW:        return "SOFTWARE";
+    case ESP_RST_PANIC:     return "PANIC (crash)";
+    case ESP_RST_INT_WDT:   return "INT_WATCHDOG";
+    case ESP_RST_TASK_WDT:  return "TASK_WATCHDOG";
+    case ESP_RST_WDT:       return "WATCHDOG";
+    case ESP_RST_BROWNOUT:  return "*** BROWNOUT (power sag!) ***";
+    case ESP_RST_SDIO:      return "SDIO";
+    default:                return "UNKNOWN";
+  }
+}
+
 void setup() {
   initializeSerial();
+
+  Serial.printf("BOOT reset reason: %s\n", resetReasonName());
+
   initializePins();
   initializeBuses();
   initializeCan();
