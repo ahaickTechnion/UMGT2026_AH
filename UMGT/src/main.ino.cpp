@@ -77,8 +77,8 @@
 // Analog inputs (J24: VP, VN, D34, D35) — "ANALOG IN"
 #define PIN_ANALOG_VP     36   // spare analog
 #define PIN_ANALOG_VN     39   // spare analog
-#define PIN_ANALOG_A      34   // QNDB6 hall current sensor (Battery)
-#define PIN_ANALOG_B      35   // QNDB6 hall current sensor (Load)
+#define PIN_ANALOG_A      34   // SSA-2 differential current sensor: OUTP (+Vo)
+#define PIN_ANALOG_B      35   // SSA-2 differential current sensor: OUTN (-Vo)
 
 // Spare GPIO on J22 "EXTRA IO": D5, D2, D14 (unused by firmware)
 
@@ -116,13 +116,23 @@ static const char   *tcNames[4]   = { "TIT", "EGT", "Bearing", "Coil" };
 #define MOSFET_PWM_RESOLUTION 8
 
 // -----------------------------------------------------------------------------
-// Current sensor calibration — QNDB6 hall sensor, 100A / 5V output variant.
-// Output is 0V at 0A, 5V at 100A → 20 A per volt, zero offset 0V.
-// NOTE: ESP32 ADC tops out ~3.3V, so readings clip above ~66A unless a divider
-// is added. Adjust at runtime with: current cal <zero_volts> <amps_per_volt>
+// Current sensor calibration — Bourns SSA-2 shunt sensor, DIFFERENTIAL output.
+// Two outputs (OUTP=+Vo on GPIO34, OUTN=-Vo on GPIO35), each sitting at a
+// ~1.44 V common-mode referenced to ground. Current is proportional to the
+// DIFFERENCE (OUTP - OUTN), read with two single-ended ADCs and subtracted in
+// software (datasheet p.6). Zero current = 0 V differential, so the reading is
+// bipolar: reverse current flips the sign instead of pinning at 0 V like the
+// old hall sensor did.
+//   SSA-2-100A  = 12.5 mV/A  -> 80  A/V   (our part; ±208 A before clipping)
+//   SSA-2-250A  = 5    mV/A  -> 200 A/V
+//   SSA-2-500A  = 2.5  mV/A  -> 400 A/V
+//   SSA-2-1000A = 1.25 mV/A  -> 800 A/V
+// Each leg swings ±1.3 V max around the 1.44 V CM (0.14..2.74 V), so no divider
+// is needed — the whole ±208 A span fits inside the ESP32 ADC. Trim the residual
+// differential offset at runtime with: current cal <zero_volts> <amps_per_volt>
 // -----------------------------------------------------------------------------
-static float currentZeroVolts = 0.0f;
-static float currentAmpsPerVolt = 20.0f;
+static float currentZeroVolts = 0.0f;   // differential-volt offset at 0 A
+static float currentAmpsPerVolt = 80.0f;  // SSA-2-100A: 12.5 mV/A
 
 // Telemetry rates. The MAX31855 converts internally every 70-100ms, so TCs are
 // sampled at a fixed 10 Hz (faster polling returns duplicate conversions).
@@ -435,8 +445,12 @@ void     handleThr(String &command, int &pos);
 void     handleFuel(String &command, int &pos);
 
 float    analogToVolts(uint16_t raw);
-float    voltsToCurrentAmps(float volts);
-float    readCurrentAmps(uint8_t pin);
+float    readLegVolts(uint8_t pin);
+float    diffVoltsToAmps(float diffV);
+float    readCurrentAmps();
+float    currentDiffVolts();
+float    currentCommonVolts();
+float    currentBusAmps();
 void     currentSensorTask();
 float    currentSmoothVolts(uint8_t idx);
 float    currentSmoothAmps(uint8_t idx);
@@ -698,9 +712,8 @@ void printHelp() {
   Serial.println("tc read all                   - Read all 4 thermocouples");
   Serial.println("tc scan                       - Probe all 16 expander CS bits (diagnostics)");
   Serial.println("tc mode 31855|6675            - Select thermocouple chip decode");
-  Serial.println("current all                   - Read both current sensors (A)");
-  Serial.println("current a|b                   - Read one current sensor (a=Battery/34, b=Load/35)");
-  Serial.println("current cal <zeroV> <A_per_V> - Set current sensor calibration");
+  Serial.println("current all                   - Read SSA-2 bus current + leg volts");
+  Serial.println("current cal <zeroV> <A_per_V> - Set current cal (SSA-2-100A: 0 80)");
   Serial.println("pot pos                       - Show tracked digital pot position (0-99)");
   Serial.println("pot up|down <n>               - Step digital pot wiper up/down");
   Serial.println("pot set <0-99>                - Move wiper to absolute position");
@@ -791,9 +804,11 @@ void printStatus() {
     printTcLine(i);
   }
 
-  // Current sensors
-  Serial.printf("Current A (Battery/34): %.3f A\n", readCurrentAmps(PIN_ANALOG_A));
-  Serial.printf("Current B (Load/35):    %.3f A\n", readCurrentAmps(PIN_ANALOG_B));
+  // Current sensor (single SSA-2 differential shunt across GPIO34/35)
+  Serial.printf("Bus current: %.3f A  (diff %.3f V, CM %.3f V)\n",
+                currentBusAmps(), currentDiffVolts(), currentCommonVolts());
+  Serial.printf("  OUTP(34)=%.3f V  OUTN(35)=%.3f V\n",
+                currentSmoothVolts(0), currentSmoothVolts(1));
   Serial.printf("Current cal: zero=%.3fV, %.2f A/V\n", currentZeroVolts, currentAmpsPerVolt);
 
   Serial.printf("Stream: %s at %u Hz (TC sampling fixed at %u Hz)\n",
@@ -851,17 +866,12 @@ void handleThermocouple(String &command, int &pos) {
 void handleCurrent(String &command, int &pos) {
   String input = getNextToken(command, pos);
 
-  if (input == "all") {
-    Serial.printf("A (34): %.3f A  (%.3f V)\n", currentSmoothAmps(0), currentSmoothVolts(0));
-    Serial.printf("B (35): %.3f A  (%.3f V)\n", currentSmoothAmps(1), currentSmoothVolts(1));
-    return;
-  }
-  if (input == "a") {
-    Serial.printf("A (34): %.3f A  (%.3f V)\n", currentSmoothAmps(0), currentSmoothVolts(0));
-    return;
-  }
-  if (input == "b") {
-    Serial.printf("B (35): %.3f A  (%.3f V)\n", currentSmoothAmps(1), currentSmoothVolts(1));
+  if (input == "all" || input == "a" || input == "b") {
+    Serial.printf("Bus current: %.3f A\n", currentBusAmps());
+    Serial.printf("  diff (OUTP-OUTN) = %.3f V, common-mode = %.3f V\n",
+                  currentDiffVolts(), currentCommonVolts());
+    Serial.printf("  OUTP(34) = %.3f V, OUTN(35) = %.3f V\n",
+                  currentSmoothVolts(0), currentSmoothVolts(1));
     return;
   }
   if (input == "cal") {
@@ -876,7 +886,7 @@ void handleCurrent(String &command, int &pos) {
     }
   }
 
-  Serial.println("Usage: current all | current a|b | current cal <zeroV> <A_per_V>");
+  Serial.println("Usage: current all | current cal <zeroV> <A_per_V>");
 }
 
 // -----------------------------------------------------------------------------
@@ -2988,27 +2998,39 @@ void handleFuel(String &command, int &pos) {
 }
 
 // -----------------------------------------------------------------------------
-// Current sensor helpers (QNDB6 hall sensors on GPIO34/35)
+// Current sensor helpers (Bourns SSA-2 differential shunt on GPIO34/35)
+//
+// GPIO34 samples OUTP (+Vo), GPIO35 samples OUTN (-Vo). Both legs idle near the
+// +1.44 V common mode; the current signal is the DIFFERENCE between them:
+//     Amps = ((V_OUTP - V_OUTN) - zeroOffset) * ampsPerVolt
+// Subtracting the two legs cancels the common mode (and any common-mode noise),
+// so the reading is bipolar and direction-aware without a bias/divider network.
 // -----------------------------------------------------------------------------
 float analogToVolts(uint16_t raw) {
   return raw * 3.3f / 4095.0f;
 }
 
-float voltsToCurrentAmps(float volts) {
-  return (volts - currentZeroVolts) * currentAmpsPerVolt;
-}
-
-float readCurrentAmps(uint8_t pin) {
-  // Average a few samples — the ESP32 ADC is noisy
+// One instantaneous averaged read of a single leg (still used by diag prints).
+float readLegVolts(uint8_t pin) {
   uint32_t sum = 0;
   for (uint8_t i = 0; i < 8; i++) sum += analogRead(pin);
-  return voltsToCurrentAmps(analogToVolts(sum / 8));
+  return analogToVolts(sum / 8);
 }
 
-// Smoothed current-sensor channels (GPIO34=idx0, GPIO35=idx1). Small currents
-// on a 100 A sensor land in the ESP32 ADC's noise floor, so we sample fast and
-// low-pass filter the *voltage* (amps derived on demand, so a live cal change
-// applies instantly). This kills the flicker without adding lag you'd notice.
+// Convert a differential voltage (OUTP - OUTN) into amps.
+float diffVoltsToAmps(float diffV) {
+  return (diffV - currentZeroVolts) * currentAmpsPerVolt;
+}
+
+// Instantaneous bus current (unsmoothed) straight off both pins.
+float readCurrentAmps() {
+  return diffVoltsToAmps(readLegVolts(PIN_ANALOG_A) - readLegVolts(PIN_ANALOG_B));
+}
+
+// Smoothed legs: curSmoothV[0]=OUTP (GPIO34), curSmoothV[1]=OUTN (GPIO35). Small
+// currents land in the ESP32 ADC's noise floor, so we oversample fast and EMA
+// each leg (amps derived on demand, so a live cal change applies instantly).
+// The datasheet explicitly recommends oversampling+averaging to lift SNR.
 static float curSmoothV[2] = { 0, 0 };
 static bool  curSmoothInit[2] = { false, false };
 
@@ -3027,8 +3049,17 @@ void currentSensorTask() {
   }
 }
 
+// Differential (OUTP - OUTN) and common-mode ((OUTP + OUTN)/2, ~1.44 V when the
+// sensor is powered and wired — a handy "sensor alive" health check).
+float currentDiffVolts()   { return curSmoothV[0] - curSmoothV[1]; }
+float currentCommonVolts() { return 0.5f * (curSmoothV[0] + curSmoothV[1]); }
+float currentBusAmps()     { return diffVoltsToAmps(currentDiffVolts()); }
+
+// Back-compat accessors used by the `current` command / stream. idx 0 = OUTP
+// leg volts, idx 1 = OUTN leg volts. Amps is the single differential bus
+// current regardless of idx (there is only one sensor now).
 float currentSmoothVolts(uint8_t idx) { return curSmoothV[idx & 1]; }
-float currentSmoothAmps(uint8_t idx)  { return voltsToCurrentAmps(curSmoothV[idx & 1]); }
+float currentSmoothAmps(uint8_t idx)  { (void)idx; return currentBusAmps(); }
 
 // -----------------------------------------------------------------------------
 // Stream data sender
@@ -3057,8 +3088,12 @@ void sendStreamData() {
   }
 
   // smoothed amps + raw pin volts (raw volts still handy for diagnosing)
-  Serial.printf("I_A=%.3f,I_AV=%.3f,", currentSmoothAmps(0), currentSmoothVolts(0));
-  Serial.printf("I_B=%.3f,I_BV=%.3f,", currentSmoothAmps(1), currentSmoothVolts(1));
+  // One SSA-2 differential sensor. I_A = bus current (A); I_AV = differential
+  // volts (OUTP-OUTN). I_B mirrors the same current (keeps the 2nd gauge live);
+  // I_BV = common-mode volts (~1.44 V) so the EXE can confirm the sensor is
+  // powered/wired at a glance.
+  Serial.printf("I_A=%.3f,I_AV=%.3f,", currentBusAmps(), currentDiffVolts());
+  Serial.printf("I_B=%.3f,I_BV=%.3f,", currentBusAmps(), currentCommonVolts());
   Serial.printf("AVP=%.3f,", analogToVolts(analogRead(PIN_ANALOG_VP)));
   Serial.printf("AVN=%.3f,", analogToVolts(analogRead(PIN_ANALOG_VN)));
   Serial.printf("POT=%d,", potPosition);
