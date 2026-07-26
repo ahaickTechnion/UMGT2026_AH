@@ -188,7 +188,9 @@ static uint8_t  s2Buf[64];
 static uint8_t  s2Len = 0;
 static uint32_t s2LastByteMs = 0;
 static bool     s2HexMode = false;
-static uint32_t serial2Baud = ECU_SERIAL_BAUD;
+// Cube Orange TELEM1 defaults to 57600 8N1 MAVLink — match it out of the box.
+#define PIXHAWK_TELEM_BAUD 57600
+static uint32_t serial2Baud = PIXHAWK_TELEM_BAUD;
 
 // Digital pot tracked wiper position (0..POT_STEPS-1). Reset to 0 at boot.
 static int potPosition = 0;
@@ -360,6 +362,8 @@ void handleCurrent(String &command, int &pos);
 void handleStream(String &command, int &pos);
 void handleI2c(String &command, int &pos);
 void handleSerial2(String &command, int &pos);
+void handlePixhawk(String &command, int &pos);
+void pxTask();
 void handlePot(String &command, int &pos);
 void handleCan(String &command, int &pos);
 
@@ -514,6 +518,7 @@ void loop() {
   ecuHeartbeat();
   processSerialCommands();
   processSerial2Bridge();
+  pxTask();
   processCanRx();
   canThrottleTask();
   nodeStatusTask();
@@ -633,6 +638,8 @@ void handleLineCommand(const String &command) {
     handleI2c(working, pos);
   } else if (token == "serial2") {
     handleSerial2(working, pos);
+  } else if (token == "px" || token == "pixhawk" || token == "mav") {
+    handlePixhawk(working, pos);
   } else if (token == "eng" || token == "engine") {
     handleEng(working, pos);
   } else if (token == "gov") {
@@ -651,6 +658,359 @@ void handleLineCommand(const String &command) {
     handleFuel(working, pos);
   } else {
     Serial.println("Unknown command. Type help for a command list.");
+  }
+}
+
+// =============================================================================
+// MAVLink — Pixhawk (Cube Orange) on Serial2 / J21, TELEM1, 57600 8N1
+//
+// Minimal hand-rolled codec (no external library). Handles both MAVLink v1
+// (0xFE) and v2 (0xFD) framing on receive, because ArduPilot may send either
+// depending on SERIAL1_PROTOCOL. On transmit we use v1 for msgid < 256 and v2
+// for the extended ids (GENERATOR_STATUS = 373) — ArduPilot's parser accepts
+// both regardless of what it emits.
+//
+// RX (what we want from the Pixhawk): barometer + altitude.
+// TX (what we give it): our generator/turbine telemetry.
+// =============================================================================
+#define MAV_STX_V1        0xFE
+#define MAV_STX_V2        0xFD
+#define PX_OUR_SYSID      1     // same vehicle as the autopilot
+#define PX_OUR_COMPID     191   // MAV_COMP_ID_ONBOARD_COMPUTER
+
+#define MAVMSG_HEARTBEAT           0
+#define MAVMSG_SYS_STATUS          1
+#define MAVMSG_SCALED_PRESSURE     29
+#define MAVMSG_GLOBAL_POSITION_INT 33
+#define MAVMSG_REQUEST_DATA_STREAM 66
+#define MAVMSG_VFR_HUD             74
+#define MAVMSG_COMMAND_LONG        76
+#define MAVMSG_ALTITUDE            141
+#define MAVMSG_NAMED_VALUE_FLOAT   251
+#define MAVMSG_GENERATOR_STATUS    373
+
+// CRC_EXTRA per message (from common.xml). A wrong value here silently drops
+// every frame of that type, so these are the verified constants.
+static uint8_t mavCrcExtra(uint32_t id) {
+  switch (id) {
+    case MAVMSG_HEARTBEAT:           return 50;
+    case MAVMSG_SYS_STATUS:          return 124;
+    case MAVMSG_SCALED_PRESSURE:     return 115;
+    case MAVMSG_GLOBAL_POSITION_INT: return 104;
+    case MAVMSG_REQUEST_DATA_STREAM: return 148;
+    case MAVMSG_VFR_HUD:             return 20;
+    case MAVMSG_COMMAND_LONG:        return 152;
+    case MAVMSG_ALTITUDE:            return 47;
+    case MAVMSG_NAMED_VALUE_FLOAT:   return 170;
+    case MAVMSG_GENERATOR_STATUS:    return 117;
+    default:                         return 0;   // unknown → we don't decode it
+  }
+}
+
+// X.25 / CRC-16-MCRF4XX, as used by MAVLink
+static void mavCrcAccum(uint8_t b, uint16_t *crc) {
+  uint8_t t = b ^ (uint8_t)(*crc & 0xFF);
+  t ^= (t << 4);
+  *crc = (*crc >> 8) ^ ((uint16_t)t << 8) ^ ((uint16_t)t << 3) ^ ((uint16_t)t >> 4);
+}
+
+// little-endian field readers
+static uint16_t mavU16(const uint8_t *p) { return (uint16_t)p[0] | ((uint16_t)p[1] << 8); }
+static int16_t  mavI16(const uint8_t *p) { return (int16_t)mavU16(p); }
+static uint32_t mavU32(const uint8_t *p) {
+  return (uint32_t)p[0] | ((uint32_t)p[1] << 8) | ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24);
+}
+static int32_t  mavI32(const uint8_t *p) { return (int32_t)mavU32(p); }
+static float    mavF32(const uint8_t *p) { float f; uint32_t v = mavU32(p); memcpy(&f, &v, 4); return f; }
+
+// ---- link + decoded telemetry state ----
+static bool     pxEnabled   = true;    // run the MAVLink parser at all
+static bool     pxRawEcho   = false;   // dump raw bytes to console (floods! debug only)
+static bool     pxGenTx     = true;    // stream our generator data up to the Pixhawk
+static uint8_t  pxTxSeq     = 0;
+static uint32_t pxGoodFrames = 0, pxBadCrc = 0, pxTxFrames = 0;
+// Raw byte counter: counts EVERY byte on Serial2 regardless of framing. This is
+// the key wiring diagnostic — if this stays 0 the RX pin is dead (miswire/no
+// data); if it climbs but frames don't, it's a baud/protocol problem.
+static uint32_t pxRawBytes = 0;
+static uint32_t pxLastHbMs  = 0, pxLastMsgMs = 0;
+static uint8_t  pxSysId = 0, pxCompId = 0, pxMavVer = 0;
+static uint32_t pxLastReqMs = 0;
+static bool     pxWasOnline = false;
+
+static float    pxPressAbs = NAN, pxPressDiff = NAN, pxBaroTempC = NAN;
+static float    pxAltAmsl = NAN, pxAltRel = NAN, pxClimb = NAN;
+static float    pxGroundSpd = NAN, pxAirSpd = NAN, pxVBatt = NAN;
+static int16_t  pxHeading = -1, pxBattRem = -1;
+
+#define PX_LINK_TIMEOUT_MS 3000
+static bool pxOnline() { return pxLastHbMs && (millis() - pxLastHbMs < PX_LINK_TIMEOUT_MS); }
+
+// ---- transmit ----
+static void mavSend(uint32_t msgid, const uint8_t *payload, uint8_t len) {
+  bool v2 = (msgid > 255);
+  uint8_t hdr[10], hlen;
+  if (v2) {
+    hdr[0] = MAV_STX_V2; hdr[1] = len; hdr[2] = 0; hdr[3] = 0; hdr[4] = pxTxSeq;
+    hdr[5] = PX_OUR_SYSID; hdr[6] = PX_OUR_COMPID;
+    hdr[7] = msgid & 0xFF; hdr[8] = (msgid >> 8) & 0xFF; hdr[9] = (msgid >> 16) & 0xFF;
+    hlen = 10;
+  } else {
+    hdr[0] = MAV_STX_V1; hdr[1] = len; hdr[2] = pxTxSeq;
+    hdr[3] = PX_OUR_SYSID; hdr[4] = PX_OUR_COMPID; hdr[5] = msgid & 0xFF;
+    hlen = 6;
+  }
+  pxTxSeq++;
+  uint16_t crc = 0xFFFF;
+  for (uint8_t i = 1; i < hlen; i++) mavCrcAccum(hdr[i], &crc);
+  for (uint8_t i = 0; i < len; i++)  mavCrcAccum(payload[i], &crc);
+  mavCrcAccum(mavCrcExtra(msgid), &crc);
+  Serial2.write(hdr, hlen);
+  if (len) Serial2.write(payload, len);
+  Serial2.write((uint8_t)(crc & 0xFF));
+  Serial2.write((uint8_t)(crc >> 8));
+  pxTxFrames++;
+}
+
+static void pxSendHeartbeat() {
+  uint8_t p[9]; memset(p, 0, sizeof(p));
+  // custom_mode u32 @0 = 0
+  p[4] = 18;  // type = MAV_TYPE_ONBOARD_CONTROLLER
+  p[5] = 8;   // autopilot = MAV_AUTOPILOT_INVALID (we're not a flight controller)
+  p[6] = 0;   // base_mode
+  p[7] = 4;   // system_status = MAV_STATE_ACTIVE
+  p[8] = 3;   // mavlink_version
+  mavSend(MAVMSG_HEARTBEAT, p, sizeof(p));
+}
+
+// Legacy stream request — still the most reliable way to make ArduPilot talk.
+static void pxRequestStream(uint8_t streamId, uint16_t rateHz, uint8_t startStop) {
+  uint8_t p[6];
+  p[0] = rateHz & 0xFF; p[1] = rateHz >> 8;
+  p[2] = pxSysId ? pxSysId : 1;   // target_system
+  p[3] = 1;                        // target_component = autopilot
+  p[4] = streamId;
+  p[5] = startStop;
+  mavSend(MAVMSG_REQUEST_DATA_STREAM, p, sizeof(p));
+}
+
+// Modern per-message rate control (MAV_CMD_SET_MESSAGE_INTERVAL = 511)
+static void pxSetMsgInterval(uint32_t msgId, uint32_t intervalUs) {
+  uint8_t p[33]; memset(p, 0, sizeof(p));
+  float f1 = (float)msgId,    f2 = (float)intervalUs;
+  memcpy(p + 0, &f1, 4); memcpy(p + 4, &f2, 4);
+  uint16_t cmd = 511; p[28] = cmd & 0xFF; p[29] = cmd >> 8;
+  p[30] = pxSysId ? pxSysId : 1;   // target_system
+  p[31] = 1;                        // target_component
+  p[32] = 0;                        // confirmation
+  mavSend(MAVMSG_COMMAND_LONG, p, sizeof(p));
+}
+
+// Ask for everything we care about. Belt-and-braces: legacy streams AND
+// explicit intervals for the two messages that actually carry baro/altitude.
+static void pxRequestData() {
+  pxRequestStream(6,  3, 1);   // POSITION        → GLOBAL_POSITION_INT
+  pxRequestStream(2,  2, 1);   // EXTENDED_STATUS → SYS_STATUS
+  pxRequestStream(10, 2, 1);   // EXTRA1          → ATTITUDE
+  pxRequestStream(11, 3, 1);   // EXTRA2          → VFR_HUD
+  pxRequestStream(12, 2, 1);   // EXTRA3          → SCALED_PRESSURE
+  pxRequestStream(1,  2, 1);   // RAW_SENSORS
+  pxSetMsgInterval(MAVMSG_SCALED_PRESSURE, 500000);   // 2 Hz
+  pxSetMsgInterval(MAVMSG_ALTITUDE,        500000);   // 2 Hz
+  pxLastReqMs = millis();
+}
+
+static void pxSendNamedFloat(const char *name, float v) {
+  uint8_t p[18]; memset(p, 0, sizeof(p));
+  uint32_t t = millis();
+  memcpy(p + 0, &t, 4);
+  memcpy(p + 4, &v, 4);
+  strncpy((char *)(p + 8), name, 10);   // char[10], not NUL-terminated on the wire
+  mavSend(MAVMSG_NAMED_VALUE_FLOAT, p, sizeof(p));
+}
+
+// GENERATOR_STATUS (373). Field order is MAVLink wire order: fields sorted by
+// size descending (u64, then all 4-byte, then all 2-byte), each group in
+// declaration order.
+static void pxSendGeneratorStatus() {
+  uint8_t p[42]; memset(p, 0, sizeof(p));
+  uint64_t status = 0;
+  memcpy(p + 0, &status, 8);
+  float loadCur  = esc.seen ? esc.current : 0.0f;
+  float busV     = esc.seen ? esc.voltage : 0.0f;
+  float powerW   = busV * loadCur;
+  float zero     = 0.0f;
+  memcpy(p +  8, &zero,    4);   // battery_current
+  memcpy(p + 12, &loadCur, 4);   // load_current
+  memcpy(p + 16, &powerW,  4);   // power_generated
+  memcpy(p + 20, &busV,    4);   // bus_voltage
+  memcpy(p + 24, &zero,    4);   // bat_current_setpoint
+  uint32_t runtime = millis() / 1000; memcpy(p + 28, &runtime, 4);
+  int32_t  untilMaint = -1;           memcpy(p + 32, &untilMaint, 4);
+  // generator_speed is uint16 rpm, but the turbine runs to ~350k RPM. 65535 is
+  // MAVLink's "unknown" sentinel, so clamp to 65534 rather than report unknown;
+  // the true shaft speed goes up as the SHAFTRPM NAMED_VALUE_FLOAT instead.
+  uint16_t rpm = (esc.seen && esc.rpm > 0) ? (uint16_t)min(esc.rpm, (int32_t)65534) : 0;
+  memcpy(p + 36, &rpm, 2);
+  int16_t rectT = esc.seen ? (int16_t)esc.tempC : 0;
+  memcpy(p + 38, &rectT, 2);
+  // generator temperature = turbine inlet temp if we have it, else coil temp
+  float gt = !isnan(tcTemp[0]) ? tcTemp[0] : (!isnan(tcTemp[3]) ? tcTemp[3] : 0.0f);
+  int16_t genT = (int16_t)gt;
+  memcpy(p + 40, &genT, 2);
+  mavSend(MAVMSG_GENERATOR_STATUS, p, sizeof(p));
+}
+
+// The engine numbers a GCS can actually plot. Names are capped at 10 chars.
+static void pxSendEngineValues() {
+  if (!isnan(tcTemp[0])) pxSendNamedFloat("TIT", tcTemp[0]);
+  pxSendNamedFloat("FUELFLOW", engineFuelFlowMlMin());
+  pxSendNamedFloat("BUSCUR", currentBusAmps());
+  if (esc.seen) pxSendNamedFloat("SHAFTRPM", (float)esc.rpm);
+}
+
+// ---- receive parser (v1 + v2) ----
+static uint8_t  pxRxState = 0;
+static uint8_t  pxRxPayload[255];
+static uint8_t  pxRxLen = 0, pxRxIdx = 0, pxRxSys = 0, pxRxComp = 0;
+static uint8_t  pxRxIncompat = 0, pxRxSigLeft = 0;
+static uint32_t pxRxMsgId = 0;
+static uint16_t pxRxCrc = 0, pxRxCrcRx = 0;
+static bool     pxRxIsV2 = false;
+
+static void pxHandleMessage() {
+  pxLastMsgMs = millis();
+  const uint8_t *b = pxRxPayload;
+  switch (pxRxMsgId) {
+    case MAVMSG_HEARTBEAT:
+      pxLastHbMs = millis();
+      pxMavVer = pxRxIsV2 ? 2 : 1;
+      pxCompId = pxRxComp;
+      if (pxRxComp == 1) pxSysId = pxRxSys;      // latch the autopilot itself
+      else if (!pxSysId) pxSysId = pxRxSys;
+      break;
+    case MAVMSG_SCALED_PRESSURE:                  // time(4) press_abs(4) press_diff(4) temp(2)
+      pxPressAbs  = mavF32(b + 4);                // hPa
+      pxPressDiff = mavF32(b + 8);
+      pxBaroTempC = mavI16(b + 12) / 100.0f;
+      break;
+    case MAVMSG_GLOBAL_POSITION_INT:              // time,lat,lon,alt,rel_alt then vx,vy,vz,hdg
+      pxAltAmsl = mavI32(b + 12) / 1000.0f;       // mm → m
+      pxAltRel  = mavI32(b + 16) / 1000.0f;
+      pxHeading = (int16_t)(mavU16(b + 26) / 100);
+      break;
+    case MAVMSG_VFR_HUD:                          // airspeed,groundspeed,alt,climb, hdg,throttle
+      pxAirSpd    = mavF32(b + 0);
+      pxGroundSpd = mavF32(b + 4);
+      pxAltAmsl   = mavF32(b + 8);
+      pxClimb     = mavF32(b + 12);
+      pxHeading   = mavI16(b + 16);
+      break;
+    case MAVMSG_ALTITUDE:                         // time_usec(8) then 6 floats
+      pxAltAmsl = mavF32(b + 12);                 // altitude_amsl
+      pxAltRel  = mavF32(b + 20);                 // altitude_relative
+      break;
+    case MAVMSG_SYS_STATUS:
+      pxVBatt   = mavU16(b + 14) / 1000.0f;       // mV → V
+      pxBattRem = (int8_t)b[30];
+      break;
+    default: break;
+  }
+}
+
+static void pxParseByte(uint8_t c) {
+  switch (pxRxState) {
+    case 0:   // hunting for a start byte
+      if (c == MAV_STX_V1 || c == MAV_STX_V2) {
+        pxRxIsV2 = (c == MAV_STX_V2);
+        pxRxCrc = 0xFFFF;
+        pxRxState = 1;
+      }
+      break;
+    case 1:   // len
+      pxRxLen = c; pxRxIdx = 0;
+      mavCrcAccum(c, &pxRxCrc);
+      pxRxState = pxRxIsV2 ? 2 : 4;
+      break;
+    case 2:   // v2 incompat_flags
+      pxRxIncompat = c; mavCrcAccum(c, &pxRxCrc); pxRxState = 3; break;
+    case 3:   // v2 compat_flags
+      mavCrcAccum(c, &pxRxCrc); pxRxState = 4; break;
+    case 4:   // seq
+      mavCrcAccum(c, &pxRxCrc); pxRxState = 5; break;
+    case 5:   // sysid
+      pxRxSys = c; mavCrcAccum(c, &pxRxCrc); pxRxState = 6; break;
+    case 6:   // compid
+      pxRxComp = c; mavCrcAccum(c, &pxRxCrc); pxRxState = 7; break;
+    case 7:   // msgid byte 0
+      pxRxMsgId = c; mavCrcAccum(c, &pxRxCrc);
+      pxRxState = pxRxIsV2 ? 8 : 10;
+      if (!pxRxIsV2 && pxRxLen == 0) pxRxState = 11;
+      break;
+    case 8:   // v2 msgid byte 1
+      pxRxMsgId |= (uint32_t)c << 8; mavCrcAccum(c, &pxRxCrc); pxRxState = 9; break;
+    case 9:   // v2 msgid byte 2
+      pxRxMsgId |= (uint32_t)c << 16; mavCrcAccum(c, &pxRxCrc);
+      pxRxState = pxRxLen ? 10 : 11;
+      break;
+    case 10:  // payload
+      if (pxRxIdx < sizeof(pxRxPayload)) pxRxPayload[pxRxIdx] = c;
+      pxRxIdx++;
+      mavCrcAccum(c, &pxRxCrc);
+      if (pxRxIdx >= pxRxLen) pxRxState = 11;
+      break;
+    case 11:  // crc low
+      pxRxCrcRx = c; pxRxState = 12; break;
+    case 12: {// crc high
+      pxRxCrcRx |= (uint16_t)c << 8;
+      uint8_t extra = mavCrcExtra(pxRxMsgId);
+      if (extra) {
+        uint16_t crc = pxRxCrc;
+        mavCrcAccum(extra, &crc);
+        if (crc == pxRxCrcRx) {
+          // v2 zero-trims trailing bytes — pad so fixed field offsets stay valid
+          if (pxRxLen < sizeof(pxRxPayload))
+            memset(pxRxPayload + pxRxLen, 0, sizeof(pxRxPayload) - pxRxLen);
+          pxGoodFrames++;
+          pxHandleMessage();
+        } else {
+          pxBadCrc++;
+        }
+      }
+      // v2 signed frames carry 13 more bytes we must skip
+      pxRxSigLeft = (pxRxIsV2 && (pxRxIncompat & 0x01)) ? 13 : 0;
+      pxRxState = pxRxSigLeft ? 13 : 0;
+      break;
+    }
+    case 13:  // discard signature
+      if (--pxRxSigLeft == 0) pxRxState = 0;
+      break;
+    default: pxRxState = 0; break;
+  }
+}
+
+// 1 Hz heartbeat out, generator telemetry at 2 Hz, re-request streams whenever
+// the link comes back (or every 10 s until the autopilot starts talking).
+void pxTask() {
+  if (!pxEnabled) return;
+  uint32_t now = millis();
+
+  static uint32_t lastHbTx = 0;
+  if (now - lastHbTx >= 1000) { lastHbTx = now; pxSendHeartbeat(); }
+
+  bool online = pxOnline();
+  if (online && !pxWasOnline) {          // link just came up
+    pxRequestData();
+  } else if (online && now - pxLastReqMs > 10000 && isnan(pxPressAbs)) {
+    pxRequestData();                      // talking, but no baro yet — ask again
+  }
+  pxWasOnline = online;
+
+  static uint32_t lastGenTx = 0;
+  if (pxGenTx && online && now - lastGenTx >= 500) {
+    lastGenTx = now;
+    pxSendGeneratorStatus();
+    pxSendEngineValues();
   }
 }
 
@@ -676,6 +1036,15 @@ static void s2Flush() {
 void processSerial2Bridge() {
   while (Serial2.available()) {
     uint8_t b = (uint8_t)Serial2.read();
+    pxRawBytes++;
+
+    // MAVLink parser gets every byte first — that's the primary consumer now.
+    if (pxEnabled) pxParseByte(b);
+
+    // Raw echo is OFF by default: a live Pixhawk at 57600 would flood the
+    // console and corrupt the exe's DATA parsing. Enable with "px raw on".
+    if (!pxRawEcho && !s2HexMode) continue;
+
     s2LastByteMs = millis();
     if (b == '\n') { s2Flush(); continue; }
     if (b == '\r') continue;
@@ -746,6 +1115,11 @@ void printHelp() {
   Serial.println("i2c scan                      - Scan I2C bus for devices");
   Serial.println("i2c expander set <hex>        - Write raw state to I2C expander");
   Serial.println("i2c expander bit <n> on|off   - Toggle one expander bit");
+  Serial.println("px status                     - Pixhawk MAVLink link + baro/altitude");
+  Serial.println("px req                        - Re-request data streams from Pixhawk");
+  Serial.println("px gen [on|off]               - Generator telemetry TX to Pixhawk");
+  Serial.println("px baud <rate>                - Serial2 baud (Cube TELEM1 = 57600)");
+  Serial.println("px raw on|off                 - Echo raw Serial2 bytes (floods!)");
   Serial.println("serial2 send <text>           - Send raw text to Serial2 (Pixhawk)");
   Serial.println("serial2 baud <rate>           - Change Serial2 baud (Pixhawk telem = 57600)");
   Serial.println("serial2 hex on|off            - Hex-dump Serial2 traffic (MAVLink is binary)");
@@ -1356,6 +1730,94 @@ void handleSerial2(String &command, int &pos) {
     }
   }
   Serial.println("Usage: serial2 send <text> | serial2 baud <rate> | serial2 hex on|off");
+}
+
+// -----------------------------------------------------------------------------
+// Pixhawk / MAVLink handler  ("px ...")
+// -----------------------------------------------------------------------------
+static void pxPrintStatus() {
+  Serial.printf("Pixhawk MAVLink: parser=%s, link=%s\n",
+                pxEnabled ? "on" : "off", pxOnline() ? "ONLINE" : "offline");
+  Serial.printf("  Serial2: %u baud on RX=GPIO%u TX=GPIO%u (J21)\n",
+                serial2Baud, PIN_UART2_RX, PIN_UART2_TX);
+  if (pxLastHbMs)
+    Serial.printf("  Heartbeat: sys=%u comp=%u MAVLink v%u, age=%lu ms\n",
+                  pxSysId, pxCompId, pxMavVer, millis() - pxLastHbMs);
+  else
+    Serial.println("  Heartbeat: none received yet");
+  Serial.printf("  Frames: %lu good, %lu bad CRC, %lu sent\n",
+                pxGoodFrames, pxBadCrc, pxTxFrames);
+  Serial.printf("  Baro:  %.2f hPa, diff %.2f hPa, %.1f C\n",
+                pxPressAbs, pxPressDiff, pxBaroTempC);
+  Serial.printf("  Alt:   AMSL %.2f m, rel %.2f m, climb %.2f m/s\n",
+                pxAltAmsl, pxAltRel, pxClimb);
+  Serial.printf("  Speed: gnd %.2f m/s, air %.2f m/s, hdg %d deg\n",
+                pxGroundSpd, pxAirSpd, pxHeading);
+  Serial.printf("  Batt:  %.2f V, %d%%\n", pxVBatt, pxBattRem);
+  Serial.printf("  Generator TX: %s\n", pxGenTx ? "on" : "off");
+}
+
+void handlePixhawk(String &command, int &pos) {
+  String action = getNextToken(command, pos);
+
+  if (action.length() == 0 || action == "status") { pxPrintStatus(); return; }
+
+  if (action == "on" || action == "off") {
+    pxEnabled = (action == "on");
+    Serial.printf("Pixhawk MAVLink parser %s\n", pxEnabled ? "ON" : "OFF");
+    return;
+  }
+  if (action == "baud") {
+    long baud = getNextToken(command, pos).toInt();
+    if (baud >= 1200 && baud <= 1000000) {
+      serial2Baud = (uint32_t)baud;
+      Serial2.updateBaudRate(serial2Baud);
+      Serial.printf("Serial2 baud set to %u (Cube TELEM1 default is 57600)\n", serial2Baud);
+      return;
+    }
+    Serial.println("Usage: px baud <1200-1000000>  (TELEM1 default 57600)");
+    return;
+  }
+  if (action == "req") {
+    pxRequestData();
+    Serial.println("Requested data streams + baro/altitude intervals from the Pixhawk");
+    return;
+  }
+  if (action == "hb") { pxSendHeartbeat(); Serial.println("Heartbeat sent"); return; }
+  if (action == "gen") {
+    String sub = getNextToken(command, pos);
+    if (sub == "on" || sub == "off") {
+      pxGenTx = (sub == "on");
+      Serial.printf("Generator telemetry TX %s\n", pxGenTx ? "ON" : "OFF");
+      return;
+    }
+    pxSendGeneratorStatus();
+    pxSendEngineValues();
+    Serial.println("Generator status + engine values sent once");
+    return;
+  }
+  if (action == "raw") {
+    String sub = getNextToken(command, pos);
+    if (sub == "on" || sub == "off") {
+      pxRawEcho = (sub == "on");
+      Serial.printf("Raw Serial2 echo %s%s\n", pxRawEcho ? "ON" : "OFF",
+                    pxRawEcho ? " (binary MAVLink will flood the console)" : "");
+      return;
+    }
+  }
+  if (action == "reset") {
+    pxGoodFrames = pxBadCrc = pxTxFrames = pxRawBytes = 0;
+    pxLastHbMs = pxLastMsgMs = 0;
+    pxPressAbs = pxPressDiff = pxBaroTempC = NAN;
+    pxAltAmsl = pxAltRel = pxClimb = pxGroundSpd = pxAirSpd = pxVBatt = NAN;
+    pxHeading = pxBattRem = -1;
+    pxSysId = pxCompId = pxMavVer = 0;
+    Serial.println("Pixhawk counters and cached telemetry cleared");
+    return;
+  }
+
+  Serial.println("Usage: px status | px on|off | px baud <rate> | px req |");
+  Serial.println("       px hb | px gen [on|off] | px raw on|off | px reset");
 }
 
 // -----------------------------------------------------------------------------
@@ -3135,6 +3597,22 @@ void sendStreamData() {
     if (i < 4) Serial.print(",");
   }
 
+  // Pixhawk / MAVLink link + decoded barometer & altitude. Only emit the
+  // decoded values once we've actually heard from the autopilot, so the exe
+  // can blank the tiles instead of showing stale numbers.
+  Serial.printf(",PX_OK=%d,PX_HB=%lu,PX_SYS=%u,PX_VER=%u,PX_RX=%lu,PX_BAD=%lu,PX_TX=%lu,PX_RAW=%lu",
+                pxOnline() ? 1 : 0,
+                pxLastHbMs ? (millis() - pxLastHbMs) : 0UL,
+                pxSysId, pxMavVer, pxGoodFrames, pxBadCrc, pxTxFrames, pxRawBytes);
+  if (!isnan(pxPressAbs))  Serial.printf(",PX_PRESS=%.2f", pxPressAbs);
+  if (!isnan(pxBaroTempC)) Serial.printf(",PX_PTEMP=%.1f", pxBaroTempC);
+  if (!isnan(pxAltAmsl))   Serial.printf(",PX_ALT=%.2f", pxAltAmsl);
+  if (!isnan(pxAltRel))    Serial.printf(",PX_RALT=%.2f", pxAltRel);
+  if (!isnan(pxClimb))     Serial.printf(",PX_CLIMB=%.2f", pxClimb);
+  if (!isnan(pxGroundSpd)) Serial.printf(",PX_GS=%.2f", pxGroundSpd);
+  if (!isnan(pxVBatt))     Serial.printf(",PX_VBAT=%.2f", pxVBatt);
+  if (pxHeading >= 0)      Serial.printf(",PX_HDG=%d", pxHeading);
+
   Serial.println();
 }
 
@@ -3282,7 +3760,7 @@ void setMosfetFrequency(uint32_t frequency) {
 void initializeSerial() {
   Serial.begin(DEBUG_BAUD);
   while (!Serial) { ; }
-  Serial2.begin(ECU_SERIAL_BAUD, SERIAL_8N1, PIN_UART2_RX, PIN_UART2_TX);
+  Serial2.begin(serial2Baud, SERIAL_8N1, PIN_UART2_RX, PIN_UART2_TX);
   Serial.println("Serial ports initialized");
 }
 
