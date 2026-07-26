@@ -9,7 +9,7 @@ Serial architecture:
 Shield I/O covered here:
   4x MAX31855 thermocouples (SPI, CS via PCF8575)  → TC card
   5x MOSFET PWM outputs (GPIO 32/33/25/26/27)      → MOSFET card
-  2x QNDB6 current sensors (GPIO 34/35)            → Current card
+  1x SSA-2 differential current sensor (GPIO 34/35) → Current card
   Spare analog VP/VN (GPIO 36/39)                  → Analog readouts
   X9C digital pot (U/D=12, INC=13, CS on expander) → Digital Pot card
   Piezo/atomizer square wave (GPIO 15)             → Piezo card
@@ -188,10 +188,8 @@ COMMANDS = [
         ("Rate 20 Hz", "stream rate 20"),
         ("Rate 50 Hz", "stream rate 50"),
     ]),
-    ("CURRENT SENSORS", [
-        ("Read All",       "current all"),
-        ("Battery (34)",   "current a"),
-        ("Load (35)",      "current b"),
+    ("CURRENT SENSOR", [
+        ("Read (SSA-2)",   "current all"),
     ]),
     ("DIGITAL POT", [
         ("Position",  "pot pos"),
@@ -477,17 +475,19 @@ class ECUDashboard(tk.Tk):
     def _build_current_card(self, parent):
         c = card(parent, "Current / Analog")
         c.master.pack(side="left", fill="both", expand=True, padx=(4,0))
+        # One SSA-2 differential sensor: bus current (from OUTP-OUTN) + the
+        # common-mode voltage (~1.44 V) as a "sensor powered/wired" health check.
         self._curr_labels: list[tk.Label] = []
-        for name in ("Battery (34)", "Load (35)"):
+        for name, unit, color in (("Bus Current", "A", YELLOW), ("Sensor CM", "V", CYAN)):
             row = tk.Frame(c, bg=SURF)
             row.pack(fill="x", pady=3)
             tk.Label(row, text=name, bg=SURF, fg=TEXT_DIM,
                      font=FONT_UI_SML, width=11, anchor="w").pack(side="left")
-            val = tk.Label(row, text="  ---  ", bg=SURF2, fg=YELLOW,
+            val = tk.Label(row, text="  ---  ", bg=SURF2, fg=color,
                            font=FONT_MONO_LG, width=8, anchor="e",
                            relief="flat", padx=6, pady=2)
             val.pack(side="left")
-            tk.Label(row, text="A", bg=SURF, fg=TEXT_DIM,
+            tk.Label(row, text=unit, bg=SURF, fg=TEXT_DIM,
                      font=FONT_UI).pack(side="left", padx=(3,0))
             self._curr_labels.append(val)
 
@@ -816,7 +816,7 @@ class ECUDashboard(tk.Tk):
                          lambda v: f"piezo freq {v[0]}")
         self._add_param(param, "Pot set",       ["Position (0-99)"],
                          lambda v: f"pot set {v[0]}")
-        self._add_param(param, "Current cal",   ["Zero (V)", "Amps per Volt"],
+        self._add_param(param, "Current cal",   ["Zero (V)", "A/V (100A=80)"],
                          lambda v: f"current cal {v[0]} {v[1]}")
         self._add_param(param, "ESC duty",      ["Percent (-100..100)"],
                          lambda v: f"can duty {v[0]}")
@@ -1090,7 +1090,8 @@ class ECUDashboard(tk.Tk):
                 except ValueError:
                     pass
 
-        for i, key in enumerate(("I_A", "I_B")):
+        # I_A = bus current (A); I_BV = common-mode volts (~1.44 V health check)
+        for i, key in enumerate(("I_A", "I_BV")):
             v = parts.get(key, "")
             if v:
                 try:

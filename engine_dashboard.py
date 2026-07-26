@@ -64,10 +64,10 @@ PARAM_META = [
     ("spool_duty",    "Spool throttle",         "%"),
     ("spool_rpm",     "Spool RPM target",       "rpm"),
     ("spool_time",    "Spool timeout",          "s"),
-    ("ign_pump",      "Ignition pump start",    "%"),
-    ("ign_ramp",      "Ignition pump ramp",     "%/s"),
-    ("ign_pump_max",  "Ignition pump max",      "%"),
-    ("lightoff_rise", "Light-off TIT rise",     "°C"),
+    ("ign_pump",      "Ignition fuel start",    "ml/min"),
+    ("ign_ramp",      "Ignition fuel ramp",     "ml/min/s"),
+    ("ign_pump_max",  "Ignition fuel max",      "ml/min"),
+    ("lightoff_tit",  "Light-off TIT (abs)",    "°C"),
     ("ign_timeout",   "Ignition timeout",       "s"),
     ("warmup_rpm",    "Warmup idle RPM",        "rpm"),
     ("glow_off_tit",  "Glow off above TIT",     "°C"),
@@ -92,7 +92,39 @@ PARAM_META = [
     ("ramp_rate",     "Ramp rate",              "%/s"),
     ("batt_min",      "Battery 0% voltage",     "V"),
     ("batt_max",      "Battery 100% voltage",   "V"),
+    ("sol_duty",      "Solenoid ON duty",       "%"),
 ]
+
+# Signals that any chart can plot (name, color). The value for each is computed
+# fresh every DATA frame in _parse_data → self._sig.
+CHART_SIGNALS = [
+    ("RPM",              CYAN),
+    ("ESC Power [W]",    GREEN),
+    ("TIT [°C]",         ORANGE),
+    ("EGT / Glow [°C]",  YELLOW),
+    ("Bearing [°C]",     GREEN),
+    ("Coil [°C]",        PURPLE),
+    ("DC Voltage [V]",   GREEN),
+    ("DC Current [A]",   YELLOW),
+    ("ESC Temp [°C]",    ORANGE),
+    ("Battery [%]",      GREEN),
+    ("Bus Current [A]",  YELLOW),
+    ("Sensor CM [V]",    CYAN),
+]
+
+# Signals plotted on the Pixhawk page (fed from the PX_* stream keys)
+PX_SIGNALS = [
+    ("Altitude AMSL [m]",  GREEN),
+    ("Altitude rel [m]",   CYAN),
+    ("Pressure [hPa]",     YELLOW),
+    ("Baro Temp [°C]",     ORANGE),
+    ("Climb [m/s]",        PURPLE),
+    ("Ground Speed [m/s]", ACCENT),
+    ("Fuel Flow [ml/min]", CYAN),
+    ("Throttle [%]",     ACCENT),
+]
+SIGNAL_COLOR = {name: color for name, color in CHART_SIGNALS}
+SIGNAL_NAMES = [name for name, _ in CHART_SIGNALS]
 
 ENG_STATE_COLORS = {
     "OFF": TEXT_DIM, "MANUAL": CYAN, "PRECHECK": YELLOW, "GLOW": ORANGE,
@@ -103,7 +135,7 @@ ENG_STATE_COLORS = {
 CSV_FIELDS = ["time", "elapsed_s", "state", "fault", "rpm", "tit_c", "glow_c",
               "bearing_c", "coil_c", "esc_v", "esc_i", "esc_w", "esc_temp_c",
               "throttle_pct", "gov_on", "gov_sp", "pump1_pct", "pump2_pct",
-              "fuel_gs", "glow_on", "battery_pct", "cur_a", "cur_b"]
+              "fuel_mlmin", "glow_on", "battery_pct", "bus_current_a", "sensor_cm_v"]
 
 
 # ── Serial worker ─────────────────────────────────────────────────────────────
@@ -154,6 +186,12 @@ class StripChart(tk.Canvas):
         self.data = collections.deque()   # (t, value)
         self.bind("<Configure>", lambda e: self.redraw())
 
+    def set_signal(self, title, color):
+        self.title = title
+        self.color = color
+        self.data.clear()
+        self.redraw()
+
     def add(self, value):
         now = time.time()
         self.data.append((now, value))
@@ -169,7 +207,9 @@ class StripChart(tk.Canvas):
             return
         self.create_text(8, 10, text=self.title, fill=TEXT_DIM,
                          font=FONT_UI_SML, anchor="w")
-        pts = [(t, v) for t, v in self.data if v == v]  # drop NaN
+        # keep only finite values (drop NaN and +/-inf)
+        pts = [(t, v) for t, v in self.data
+               if v == v and v not in (float("inf"), float("-inf"))]
         if len(pts) < 2:
             return
         vmin = min(v for _, v in pts)
@@ -217,7 +257,7 @@ class EngineDashboard(tk.Tk):
         super().__init__()
         self.title("UMGT Engine Control")
         self.configure(bg=BG)
-        self.minsize(1480, 900)
+        self.minsize(1040, 660)   # fits laptop screens; drag the column sashes to fit
 
         self._worker = None
         self._rx_q = queue.Queue()
@@ -234,6 +274,7 @@ class EngineDashboard(tk.Tk):
         self._slider_inhibit = False
         self._eng_state = "OFF"
         self._connect_t = None
+        self._data_seen = False
 
         # Anti-bounce: while the user is dragging a control (and for a grace
         # period after release, until the ECU echoes the new value back) the
@@ -326,25 +367,269 @@ class EngineDashboard(tk.Tk):
         body = tk.Frame(self, bg=BG)
         body.pack(fill="both", expand=True, padx=6, pady=6)
 
-        left = tk.Frame(body, bg=BG)      # graphs + gauges
-        left.pack(side="left", fill="both", expand=True)
-        mid = tk.Frame(body, bg=BG)       # ESC + fuel controls
-        mid.pack(side="left", fill="y", padx=6)
-        right = tk.Frame(body, bg=BG)     # sequencer + params + log
-        right.pack(side="left", fill="both")
+        # Engine Data is a full-width status strip along the very bottom, kept
+        # OUTSIDE the notebook so it stays visible on every page. (Built
+        # bottom-first so it reserves its height before the pages claim the rest.)
+        bottom = tk.Frame(body, bg=BG)
+        bottom.pack(side="bottom", fill="x")
+
+        self._configure_ttk()
+        nb = ttk.Notebook(body)
+        nb.pack(side="top", fill="both", expand=True)
+
+        page_eng = tk.Frame(nb, bg=BG)
+        page_px  = tk.Frame(nb, bg=BG)
+        nb.add(page_eng, text="  Engine  ")
+        nb.add(page_px,  text="  Pixhawk  ")
+
+        # Three columns split by DRAGGABLE dividers (a PanedWindow). Grab either
+        # sash — the cursor turns into a ↔ — and drag to give a column more or
+        # less room. Lets you rebalance on small laptop screens where the fixed
+        # layout would otherwise squash the buttons.
+        top = tk.PanedWindow(page_eng, orient="horizontal", bg="#39406a",
+                             sashwidth=8, sashrelief="flat", bd=0,
+                             sashpad=0, opaqueresize=True)
+        top.pack(side="top", fill="both", expand=True)
+
+        left = tk.Frame(top, bg=BG)       # graphs
+        mid = tk.Frame(top, bg=BG)        # ESC + fuel controls
+        right = tk.Frame(top, bg=BG)      # sequencer + params + log
+        # Charts pane absorbs spare space on resize; the two control columns keep
+        # their width (and their buttons legible) unless you drag a sash.
+        top.add(left,  minsize=240, width=560, stretch="always")
+        top.add(mid,   minsize=300, width=360, stretch="never")
+        top.add(right, minsize=330, width=470, stretch="never")
 
         self._build_graphs(left)
-        self._build_gauges(left)
         self._build_esc_panel(mid)
         self._build_fuel_panel(mid)
+        self._build_current_cal(mid)
         self._build_seq_panel(right)
         self._build_param_panel(right)
         self._build_esc_params(right)
         self._build_log(right)
+        self._build_pixhawk_page(page_px)
+        self._build_gauges(bottom)        # spans the full window width
 
-    # ── Graphs (LabVIEW: RPM, Generator Power, Pressure Ratio→TIT, Coil) ────
+    def _configure_ttk(self):
+        s = ttk.Style(self)
+        s.theme_use("default")
+        s.configure("TNotebook", background=BG, borderwidth=0, tabmargins=[0, 0, 0, 0])
+        s.configure("TNotebook.Tab", background=SURF2, foreground=TEXT_DIM,
+                    padding=[22, 7], font=FONT_UI_B, borderwidth=0)
+        s.map("TNotebook.Tab",
+              background=[("selected", SURF), ("active", SURF)],
+              foreground=[("selected", ACCENT), ("active", TEXT)])
+
+    # ── Pixhawk / MAVLink page ───────────────────────────────────────────────
+    # Cube Orange on TELEM1 → J21 (ESP32 Serial2, GPIO16/17) at 57600 8N1.
+    # The ESP32 does the MAVLink decoding and republishes the values as PX_* keys
+    # in the DATA stream, so this page is a pure view over those keys.
+    def _build_pixhawk_page(self, parent):
+        wrap = tk.Frame(parent, bg=BG)
+        wrap.pack(fill="both", expand=True)
+
+        col_l = tk.Frame(wrap, bg=BG)
+        col_l.pack(side="left", fill="both", expand=True)
+        col_r = tk.Frame(wrap, bg=BG)
+        col_r.pack(side="left", fill="both", expand=True, padx=(8, 0))
+
+        # ---- link status -----------------------------------------------------
+        c = card(col_l, "MAVLink Link  (Cube Orange · TELEM1 → J21 · Serial2)")
+        c.master.pack(fill="x")
+
+        srow = tk.Frame(c, bg=SURF)
+        srow.pack(fill="x", pady=(0, 6))
+        self._px_link = tk.Label(srow, text="● NO LINK", bg=SURF, fg=RED,
+                                 font=("Segoe UI", 13, "bold"))
+        self._px_link.pack(side="left")
+        self._px_sub = tk.Label(srow, text="waiting for heartbeat…", bg=SURF,
+                                fg=TEXT_DIM, font=FONT_UI_SML)
+        self._px_sub.pack(side="left", padx=10)
+
+        self._px_stats = {}
+        grid = tk.Frame(c, bg=SURF)
+        grid.pack(fill="x")
+        for i, (key, label) in enumerate((("raw", "Raw bytes in"), ("rx", "Frames OK"),
+                                          ("bad", "Bad CRC"), ("tx", "Frames Sent"),
+                                          ("hb", "HB age"))):
+            grid.columnconfigure(i, weight=1)
+            box = tk.Frame(grid, bg=SURF2, padx=8, pady=4)
+            box.grid(row=0, column=i, sticky="nsew", padx=2)
+            tk.Label(box, text=label, bg=SURF2, fg=TEXT_DIM,
+                     font=FONT_UI_SML).pack(anchor="w")
+            v = tk.Label(box, text="---", bg=SURF2, fg=CYAN, font=FONT_MONO_MD,
+                         width=9, anchor="w")
+            v.pack(anchor="w")
+            self._px_stats[key] = v
+
+        # ---- barometer + altitude -------------------------------------------
+        c2 = card(col_l, "Barometer / Altitude  (from Pixhawk)")
+        c2.master.pack(fill="x", pady=(6, 0))
+        self._px_vals = {}
+        specs = [
+            ("press", "Pressure",        "hPa"),
+            ("ptemp", "Baro Temp",       "°C"),
+            ("alt",   "Altitude AMSL",   "m"),
+            ("ralt",  "Altitude (rel)",  "m"),
+            ("climb", "Climb Rate",      "m/s"),
+            ("gs",    "Ground Speed",    "m/s"),
+            ("hdg",   "Heading",         "°"),
+            ("vbat",  "Pixhawk Batt",    "V"),
+        ]
+        g2 = tk.Frame(c2, bg=SURF)
+        g2.pack(fill="x")
+        for i, (key, label, unit) in enumerate(specs):
+            r, col = divmod(i, 4)
+            g2.columnconfigure(col, weight=1)
+            box = tk.Frame(g2, bg=SURF2, padx=8, pady=5)
+            box.grid(row=r, column=col, sticky="nsew", padx=2, pady=2)
+            tk.Label(box, text=label, bg=SURF2, fg=TEXT_DIM,
+                     font=FONT_UI_SML).pack(anchor="w")
+            v = tk.Label(box, text="---", bg=SURF2, fg=GREEN, font=FONT_MONO_LG,
+                         width=8, anchor="w")
+            v.pack(anchor="w")
+            tk.Label(box, text=unit, bg=SURF2, fg=TEXT_DIM,
+                     font=("Segoe UI", 8)).pack(anchor="w")
+            self._px_vals[key] = v
+
+        # ---- charts ----------------------------------------------------------
+        c3 = card(col_l, "Trend  (120 s)")
+        c3.master.pack(fill="both", expand=True, pady=(6, 0))
+        self._px_charts = []
+        px_color = dict(PX_SIGNALS)
+        px_names = [s for s, _ in PX_SIGNALS]
+        for var_default in ("Altitude AMSL [m]", "Pressure [hPa]"):
+            hdr = tk.Frame(c3, bg=SURF)
+            hdr.pack(fill="x")
+            var = tk.StringVar(value=var_default)
+            cb = ttk.Combobox(hdr, textvariable=var, state="readonly", width=20,
+                              values=px_names, font=FONT_UI_SML)
+            cb.pack(side="left", padx=2, pady=1)
+            ch = StripChart(c3, var_default, px_color.get(var_default, GREEN),
+                            height=130)
+            ch.pack(fill="both", expand=True)
+            cb.bind("<<ComboboxSelected>>",
+                    lambda e, c=ch, v=var: c.set_signal(
+                        v.get(), px_color.get(v.get(), GREEN)))
+            self._px_charts.append((ch, var))
+
+        # ---- control / setup -------------------------------------------------
+        c4 = card(col_r, "Link Control")
+        c4.master.pack(fill="x")
+        brow = tk.Frame(c4, bg=SURF)
+        brow.pack(fill="x")
+        self._sbtn(brow, "Request streams", lambda: self._send("px req"),
+                   fg=GREEN).pack(side="left", fill="x", expand=True, padx=2)
+        self._sbtn(brow, "Status → log", lambda: self._send("px status"),
+                   fg=CYAN).pack(side="left", fill="x", expand=True, padx=2)
+        brow2 = tk.Frame(c4, bg=SURF)
+        brow2.pack(fill="x", pady=(4, 0))
+        self._sbtn(brow2, "Send heartbeat", lambda: self._send("px hb"),
+                   fg=CYAN).pack(side="left", fill="x", expand=True, padx=2)
+        self._sbtn(brow2, "Reset counters", lambda: self._send("px reset"),
+                   fg=YELLOW).pack(side="left", fill="x", expand=True, padx=2)
+
+        baudrow = tk.Frame(c4, bg=SURF)
+        baudrow.pack(fill="x", pady=(6, 0))
+        tk.Label(baudrow, text="Baud", bg=SURF, fg=TEXT_DIM,
+                 font=FONT_UI_SML).pack(side="left")
+        self._px_baud = tk.StringVar(value="57600")
+        ttk.Combobox(baudrow, textvariable=self._px_baud, state="readonly", width=9,
+                     values=["57600", "115200", "921600", "38400", "19200"]
+                     ).pack(side="left", padx=4)
+        self._sbtn(baudrow, "Apply",
+                   lambda: self._send(f"px baud {self._px_baud.get()}"),
+                   fg=GREEN).pack(side="left", padx=2)
+        tk.Label(c4, text="Cube TELEM1 default is 57600. If there's no link, check "
+                          "GND/RX↔TX are crossed and\nset BRD_SER1_RTSCTS=0 (no flow "
+                          "control on a 3-wire hookup).",
+                 bg=SURF, fg=TEXT_DIM, font=FONT_UI_SML, justify="left").pack(
+                     anchor="w", pady=(6, 0))
+
+        # ---- generator telemetry we publish upward ---------------------------
+        c5 = card(col_r, "Generator Telemetry → Pixhawk")
+        c5.master.pack(fill="x", pady=(6, 0))
+        tk.Label(c5, text="Sent at 2 Hz as GENERATOR_STATUS (bus V/A, power, RPM,\n"
+                          "temps) plus NAMED_VALUE_FLOAT: TIT, FUELFLOW, BUSCUR,\n"
+                          "SHAFTRPM — visible in Mission Planner and logged.",
+                 bg=SURF, fg=TEXT_DIM, font=FONT_UI_SML, justify="left").pack(anchor="w")
+        grow = tk.Frame(c5, bg=SURF)
+        grow.pack(fill="x", pady=(6, 0))
+        self._sbtn(grow, "TX ON", lambda: self._send("px gen on"),
+                   fg=GREEN).pack(side="left", fill="x", expand=True, padx=2)
+        self._sbtn(grow, "TX OFF", lambda: self._send("px gen off"),
+                   fg=RED).pack(side="left", fill="x", expand=True, padx=2)
+        self._sbtn(grow, "Send once", lambda: self._send("px gen"),
+                   fg=CYAN).pack(side="left", fill="x", expand=True, padx=2)
+
+        # ---- diagnostics -----------------------------------------------------
+        c6 = card(col_r, "Diagnostics")
+        c6.master.pack(fill="x", pady=(6, 0))
+        drow = tk.Frame(c6, bg=SURF)
+        drow.pack(fill="x")
+        self._sbtn(drow, "Parser ON", lambda: self._send("px on"),
+                   fg=GREEN).pack(side="left", fill="x", expand=True, padx=2)
+        self._sbtn(drow, "Parser OFF", lambda: self._send("px off"),
+                   fg=TEXT_DIM).pack(side="left", fill="x", expand=True, padx=2)
+        drow2 = tk.Frame(c6, bg=SURF)
+        drow2.pack(fill="x", pady=(4, 0))
+        self._sbtn(drow2, "Raw echo ON", lambda: self._send("px raw on"),
+                   fg=YELLOW).pack(side="left", fill="x", expand=True, padx=2)
+        self._sbtn(drow2, "Raw echo OFF", lambda: self._send("px raw off"),
+                   fg=TEXT_DIM).pack(side="left", fill="x", expand=True, padx=2)
+        tk.Label(c6, text="Raw echo dumps binary MAVLink to the log — noisy, and it\n"
+                          "will disturb the data stream. Use only to prove bytes arrive.",
+                 bg=SURF, fg=TEXT_DIM, font=FONT_UI_SML, justify="left").pack(
+                     anchor="w", pady=(6, 0))
+
+    def _update_pixhawk(self, parts, fget):
+        """Refresh the Pixhawk page from the PX_* keys in a DATA line."""
+        online = parts.get("PX_OK") == "1"
+        if online:
+            self._px_link.config(text="● LINK UP", fg=GREEN)
+            sysid = parts.get("PX_SYS", "?")
+            ver   = parts.get("PX_VER", "?")
+            self._px_sub.config(text=f"heartbeat from system {sysid}, MAVLink v{ver}")
+        else:
+            self._px_link.config(text="● NO LINK", fg=RED)
+            self._px_sub.config(text="no heartbeat — check wiring, baud, TELEM1")
+
+        # Raw byte count is the wiring verdict: 0 = nothing on the RX pin at all.
+        raw = parts.get("PX_RAW", "")
+        self._px_stats["raw"].config(
+            text=raw or "---",
+            fg=RED if raw == "0" else GREEN)
+        self._px_stats["rx"].config(text=parts.get("PX_RX", "---"))
+        bad = parts.get("PX_BAD", "0")
+        self._px_stats["bad"].config(text=bad, fg=RED if bad not in ("0", "") else CYAN)
+        self._px_stats["tx"].config(text=parts.get("PX_TX", "---"))
+        hb = parts.get("PX_HB", "")
+        self._px_stats["hb"].config(text=f"{hb} ms" if hb else "---")
+
+        vals = {
+            "press": fget("PX_PRESS"), "ptemp": fget("PX_PTEMP"),
+            "alt":   fget("PX_ALT"),   "ralt":  fget("PX_RALT"),
+            "climb": fget("PX_CLIMB"), "gs":    fget("PX_GS"),
+            "hdg":   fget("PX_HDG"),   "vbat":  fget("PX_VBAT"),
+        }
+        fmt = {"press": "{:.2f}", "ptemp": "{:.1f}", "alt": "{:.2f}",
+               "ralt": "{:.2f}", "climb": "{:.2f}", "gs": "{:.2f}",
+               "hdg": "{:.0f}", "vbat": "{:.2f}"}
+        for k, v in vals.items():
+            self._px_vals[k].config(text=fmt[k].format(v) if v == v else "---")
+
+        self._px_sig = {
+            "Altitude AMSL [m]": vals["alt"], "Altitude rel [m]": vals["ralt"],
+            "Pressure [hPa]": vals["press"],  "Baro Temp [°C]": vals["ptemp"],
+            "Climb [m/s]": vals["climb"],     "Ground Speed [m/s]": vals["gs"],
+        }
+        for chart, var in self._px_charts:
+            chart.add(self._px_sig.get(var.get(), float("nan")))
+
+    # ── Graphs — 4 charts, each plots any signal you pick from its dropdown ──
     def _build_graphs(self, parent):
-        g = card(parent, "Charts  (120 s)")
+        g = card(parent, "Charts  (120 s)  —  pick a signal per chart")
         g.master.pack(fill="both", expand=True)
         grid = tk.Frame(g, bg=SURF)
         grid.pack(fill="both", expand=True)
@@ -352,26 +637,49 @@ class EngineDashboard(tk.Tk):
             grid.columnconfigure(c, weight=1)
         for r in (0, 1):
             grid.rowconfigure(r, weight=1)
-        self._ch_rpm   = StripChart(grid, "RPM", CYAN)
-        self._ch_power = StripChart(grid, "Generator / ESC Power [W]", GREEN)
-        self._ch_tit   = StripChart(grid, "Turbine Inlet Temperature [°C]", ORANGE)
-        self._ch_coil  = StripChart(grid, "Coil Temperature [°C]", PURPLE)
-        self._ch_rpm.grid(row=0, column=0, sticky="nsew", padx=2, pady=2)
-        self._ch_power.grid(row=0, column=1, sticky="nsew", padx=2, pady=2)
-        self._ch_tit.grid(row=1, column=0, sticky="nsew", padx=2, pady=2)
-        self._ch_coil.grid(row=1, column=1, sticky="nsew", padx=2, pady=2)
+        self._charts = []   # list of (StripChart, StringVar)
+        defaults = ["RPM", "ESC Power [W]", "TIT [°C]", "Coil [°C]"]
+        for idx, dflt in enumerate(defaults):
+            r, c = divmod(idx, 2)
+            self._make_chart(grid, r, c, dflt)
+
+    def _make_chart(self, grid, r, c, default_signal):
+        frame = tk.Frame(grid, bg=SURF)
+        frame.grid(row=r, column=c, sticky="nsew", padx=2, pady=2)
+        hdr = tk.Frame(frame, bg=SURF)
+        hdr.pack(fill="x")
+        var = tk.StringVar(value=default_signal)
+        cb = ttk.Combobox(hdr, textvariable=var, state="readonly",
+                          values=SIGNAL_NAMES, width=16, font=FONT_UI_SML)
+        cb.pack(side="left", padx=2, pady=1)
+        chart = StripChart(frame, default_signal,
+                           SIGNAL_COLOR.get(default_signal, CYAN))
+        chart.pack(fill="both", expand=True)
+        cb.bind("<<ComboboxSelected>>",
+                lambda e, ch=chart, v=var: ch.set_signal(
+                    v.get(), SIGNAL_COLOR.get(v.get(), CYAN)))
+        self._charts.append((chart, var))
 
     # ── Gauges row ────────────────────────────────────────────────────────────
     def _gauge(self, parent, label, unit, color, warn=None):
+        # pack_propagate(False) + fixed-width labels so the frame keeps a constant
+        # size no matter what text lands in it — otherwise a value gaining a "-"
+        # sign or an extra digit resizes the gauge and reflows (shakes) the whole
+        # row. The value font is monospace, so width= in chars == fixed pixels.
         grp = tk.Frame(parent, bg=SURF2, padx=8, pady=5)
+        grp.pack_propagate(False)
+        grp.config(height=68)
         tk.Label(grp, text=label, bg=SURF2, fg=TEXT_DIM,
-                 font=FONT_UI_SML).pack(anchor="w")
-        val = tk.Label(grp, text="---", bg=SURF2, fg=color, font=FONT_MONO_LG)
+                 font=FONT_UI_SML, anchor="w").pack(anchor="w", fill="x")
+        val = tk.Label(grp, text="---", bg=SURF2, fg=color, font=FONT_MONO_LG,
+                       width=8, anchor="w")
         val.pack(anchor="w")
-        tk.Label(grp, text=unit, bg=SURF2, fg=TEXT_DIM,
-                 font=("Segoe UI", 8)).pack(anchor="w")
+        unit_lbl = tk.Label(grp, text=unit, bg=SURF2, fg=TEXT_DIM,
+                            font=("Segoe UI", 8), width=16, anchor="w")
+        unit_lbl.pack(anchor="w")
         grp.base_color = color
         grp.warn = warn
+        grp.unit_lbl = unit_lbl   # so current gauges can append raw volts
         return grp, val
 
     def _build_gauges(self, parent):
@@ -391,7 +699,9 @@ class EngineDashboard(tk.Tk):
             ("esc_w",   "DC Power",           "W",   PURPLE, None),
             ("batt",    "Battery",            "%",   GREEN,  None),
             ("esc_t",   "ESC Temp",           "°C",  ORANGE, None),
-            ("fuel",    "Fuel Flow",          "g/s", CYAN,   None),
+            ("fuel",    "Fuel Flow",          "ml/min", CYAN, None),
+            ("cur34",   "Bus Current",        "A",   YELLOW, None),
+            ("cur35",   "Sensor CM",          "V",   CYAN,   None),
         ]
         for i, (key, label, unit, color, warn) in enumerate(specs):
             row.columnconfigure(i, weight=1)
@@ -570,6 +880,76 @@ class EngineDashboard(tk.Tk):
             self._sbtn(srow, "OFF", lambda n=i: self._send(f"sol {n} off"),
                        fg=RED, padx=10).pack(side="right", padx=2)
 
+    # ── Current sensor calibration ───────────────────────────────────────────
+    def _build_current_cal(self, parent):
+        c = card(parent, "Current Sensor Cal  (SSA-2 differential, GPIO34/35)")
+        c.master.pack(fill="x", pady=(6, 0))
+
+        # live readout: differential volts (the signal) and common-mode (health)
+        vrow = tk.Frame(c, bg=SURF)
+        vrow.pack(fill="x")
+        self._cur_vlbl = {}
+        for key, title in (("34", "Differential V"), ("35", "Common-mode V")):
+            box = tk.Frame(vrow, bg=SURF2, padx=8, pady=3)
+            box.pack(side="left", expand=True, fill="x", padx=2)
+            tk.Label(box, text=title, bg=SURF2, fg=TEXT_DIM,
+                     font=FONT_UI_SML).pack(anchor="w")
+            lbl = tk.Label(box, text="--- V", bg=SURF2, fg=CYAN,
+                           font=FONT_MONO_MD)
+            lbl.pack(anchor="w")
+            self._cur_vlbl[key] = lbl
+
+        # zero-volts and amps-per-volt fields (firmware cal is shared by both)
+        crow = tk.Frame(c, bg=SURF)
+        crow.pack(fill="x", pady=(4, 0))
+        tk.Label(crow, text="Zero V", bg=SURF, fg=TEXT_DIM,
+                 font=FONT_UI_SML).pack(side="left")
+        self._cal_zero = tk.StringVar(value="0")
+        tk.Entry(crow, textvariable=self._cal_zero, width=7, bg="#0d0d14",
+                 fg=TEXT, font=FONT_MONO, relief="flat", insertbackground=TEXT,
+                 highlightthickness=1, highlightbackground=BORDER,
+                 highlightcolor=ACCENT).pack(side="left", padx=3, ipady=1)
+        tk.Label(crow, text="A / V", bg=SURF, fg=TEXT_DIM,
+                 font=FONT_UI_SML).pack(side="left")
+        self._cal_apv = tk.StringVar(value="80")
+        tk.Entry(crow, textvariable=self._cal_apv, width=7, bg="#0d0d14",
+                 fg=TEXT, font=FONT_MONO, relief="flat", insertbackground=TEXT,
+                 highlightthickness=1, highlightbackground=BORDER,
+                 highlightcolor=ACCENT).pack(side="left", padx=3, ipady=1)
+        self._sbtn(crow, "Apply", self._apply_cal,
+                   fg=GREEN).pack(side="left", padx=3)
+
+        # helpers: zero-now trims residual differential offset at 0 A; the model
+        # presets set A/V per the SSA-2 variant (zero is always 0 for a shunt).
+        brow = tk.Frame(c, bg=SURF)
+        brow.pack(fill="x", pady=(4, 0))
+        self._sbtn(brow, "Zero now (@0A)", self._zero_now,
+                   fg=YELLOW).pack(side="left", fill="x", expand=True, padx=2)
+        prow = tk.Frame(c, bg=SURF)
+        prow.pack(fill="x", pady=(4, 0))
+        for name, apv in (("100A", 80), ("250A", 200), ("500A", 400), ("1000A", 800)):
+            self._sbtn(prow, name, lambda a=apv: self._preset_cal(0, a),
+                       fg=CYAN).pack(side="left", fill="x", expand=True, padx=2)
+
+    def _apply_cal(self):
+        z = self._cal_zero.get().strip()
+        a = self._cal_apv.get().strip()
+        if z and a:
+            self._send(f"current cal {z} {a}")
+
+    def _preset_cal(self, zero, apv):
+        self._cal_zero.set(str(zero))
+        self._cal_apv.set(str(apv))
+        self._apply_cal()
+
+    def _zero_now(self):
+        # capture the present differential voltage as the 0 A offset (should be
+        # near 0 — trims the sensor's residual DC offset with no current flowing)
+        v = getattr(self, "_last_diffv", None)
+        if v is not None and v == v:
+            self._cal_zero.set(f"{v:.4f}")
+            self._apply_cal()
+
     # ── Sequencer panel ──────────────────────────────────────────────────────
     def _build_seq_panel(self, parent):
         c = card(parent, "Engine Sequencer")
@@ -639,14 +1019,24 @@ class EngineDashboard(tk.Tk):
             self._param_entries[name] = var
             self._param_widgets[name] = e
 
+        # 2x2 grid so all four buttons fit the panel width (a single row clips
+        # the last button off the right edge).
+        # Apply = live to ECU RAM; Save to ECU = persist to ECU flash (survives
+        # reboot); Read = pull ECU's live values; Save local = JSON on this PC.
         btns = tk.Frame(c.master, bg=SURF)
         btns.pack(fill="x", side="bottom", pady=2, padx=2)
-        self._sbtn(btns, "Apply all", self._send_all_params,
-                   fg=GREEN).pack(side="left", fill="x", expand=True, padx=2)
-        self._sbtn(btns, "Read from ECU", lambda: self._send("eng params"),
-                   fg=ACCENT).pack(side="left", fill="x", expand=True, padx=2)
-        self._sbtn(btns, "Save local", self._save_local_params,
-                   fg=CYAN).pack(side="left", fill="x", expand=True, padx=2)
+        for i in (0, 1):
+            btns.columnconfigure(i, weight=1)
+        specs = [
+            ("Apply all (live)", self._send_all_params, GREEN),
+            ("Save to ECU", self._save_to_ecu, YELLOW),
+            ("Read from ECU", lambda: self._send("eng params"), ACCENT),
+            ("Save local", self._save_local_params, CYAN),
+        ]
+        for idx, (label, cmd, color) in enumerate(specs):
+            r, c2 = divmod(idx, 2)
+            self._sbtn(btns, label, cmd, fg=color).grid(
+                row=r, column=c2, sticky="ew", padx=2, pady=1)
 
     # ── ESC parameters (DroneCAN GetSet) ─────────────────────────────────────
     def _build_esc_params(self, parent):
@@ -681,6 +1071,8 @@ class EngineDashboard(tk.Tk):
             if n and v:
                 self._send(f"can param set {n} {v}")
 
+        # Get/Set/List on one row, Save/Restart on the next — five across a
+        # narrow panel clips the rightmost buttons.
         row2 = tk.Frame(c, bg=SURF)
         row2.pack(fill="x", pady=(3, 0))
         self._sbtn(row2, "Get", escp_get, fg=ACCENT).pack(
@@ -689,9 +1081,11 @@ class EngineDashboard(tk.Tk):
             side="left", fill="x", expand=True, padx=2)
         self._sbtn(row2, "List all", lambda: self._send("can param list"),
                    fg=CYAN).pack(side="left", fill="x", expand=True, padx=2)
-        self._sbtn(row2, "Save NVM", lambda: self._send("can save"),
+        row3 = tk.Frame(c, bg=SURF)
+        row3.pack(fill="x", pady=(3, 0))
+        self._sbtn(row3, "Save NVM", lambda: self._send("can save"),
                    fg=YELLOW).pack(side="left", fill="x", expand=True, padx=2)
-        self._sbtn(row2, "Restart ESC", lambda: self._send("can restart"),
+        self._sbtn(row3, "Restart ESC", lambda: self._send("can restart"),
                    fg=ORANGE).pack(side="left", fill="x", expand=True, padx=2)
 
     # ── Event log / terminal ─────────────────────────────────────────────────
@@ -741,8 +1135,17 @@ class EngineDashboard(tk.Tk):
             self._worker.start()
             self._conn_btn.config(text="Disconnect", fg=RED)
             self._connect_t = time.time()
-            # ESP32 resets on connect; after boot pull params + push saved ones
-            self.after(3000, lambda: self._send("eng params"))
+            self._data_seen = False
+            # ESP32 resets on connect; after boot enable the stream + pull params
+            self.after(3000, lambda: self._send("stream on"))
+            self.after(3200, lambda: self._send("eng params"))
+            # fallback: if no DATA has arrived a few seconds in, force it on
+            self.after(6000, self._ensure_stream)
+
+    def _ensure_stream(self):
+        if self._worker and self._worker.is_alive() and not self._data_seen:
+            self._log("no data yet — sending 'stream on'", "event")
+            self._send("stream on")
 
     def _send(self, cmd):
         if self._worker and self._worker.is_alive():
@@ -829,6 +1232,11 @@ class EngineDashboard(tk.Tk):
             if v:
                 self._send(f"eng set {name} {v}")
 
+    def _save_to_ecu(self):
+        # push current field values live, then persist them to ECU flash
+        self._send_all_params()
+        self.after(300, lambda: self._send("eng save"))
+
     def _save_local_params(self):
         data = {n: self._param_entries[n].get() for n, _, _ in PARAM_META
                 if self._param_entries[n].get().strip()}
@@ -886,20 +1294,28 @@ class EngineDashboard(tk.Tk):
 
     # ── Incoming data ─────────────────────────────────────────────────────────
     def _poll(self):
+        # Each item is processed in its own guard, and the reschedule lives in
+        # finally — a single malformed line can never kill the ingestion loop
+        # (which used to freeze the whole UI, charts included).
         try:
             while True:
-                kind, text = self._rx_q.get_nowait()
-                if kind == "line":
-                    self._on_line(text)
-                elif kind == "status":
-                    ok = "Connected" in text
-                    self._status_lbl.config(text=f"●  {text}",
-                                            fg=GREEN if ok else RED)
-                elif kind == "error":
-                    self._log(f"serial error: {text}", "fault")
-        except queue.Empty:
-            pass
-        self.after(40, self._poll)
+                try:
+                    kind, text = self._rx_q.get_nowait()
+                except queue.Empty:
+                    break
+                try:
+                    if kind == "line":
+                        self._on_line(text)
+                    elif kind == "status":
+                        ok = "Connected" in text
+                        self._status_lbl.config(text=f"●  {text}",
+                                                fg=GREEN if ok else RED)
+                    elif kind == "error":
+                        self._log(f"serial error: {text}", "fault")
+                except Exception as e:
+                    self._log(f"parse error: {e}", "fault")
+        finally:
+            self.after(40, self._poll)
 
     def _on_line(self, line):
         if line == "HB":
@@ -907,7 +1323,15 @@ class EngineDashboard(tk.Tk):
             return
         if line.startswith("DATA:"):
             self._last_hb = time.time()
+            self._data_seen = True
             self._parse_data(line[5:])
+            return
+        if line.startswith("BOOT reset reason:"):
+            # The ESP32 just (re)booted while we were connected — a mid-run
+            # reset means it dropped out (brownout etc.), taking sensors/CAN
+            # with it. Surface it loudly.
+            tag = "fault" if "BROWNOUT" in line or "PANIC" in line else "event"
+            self._log("⚠ ESP32 REBOOTED — " + line, tag)
             return
         if line.startswith("ENG:FAULT="):
             self._log(line, "fault")
@@ -961,6 +1385,10 @@ class EngineDashboard(tk.Tk):
         p1    = fget("P1")
         p2    = fget("P2")
         ff    = fget("FF")
+        # Single Bourns SSA-2 differential shunt across GPIO34/35.
+        bus_i  = fget("I_A")   # bus current (A), from OUTP-OUTN differential
+        diffv  = fget("I_AV")  # differential volts (OUTP-OUTN)
+        cmv    = fget("I_BV")  # common-mode volts (~1.44 V = sensor alive)
 
         # battery % from voltage using local param fields
         try:
@@ -980,12 +1408,37 @@ class EngineDashboard(tk.Tk):
         self._set_gauge("esc_w", power, "{:.1f}")
         self._set_gauge("batt", batt, "{:.0f}")
         self._set_gauge("esc_t", esc_t, "{:.1f}")
-        self._set_gauge("fuel", ff, "{:.3f}")
+        self._set_gauge("fuel", ff, "{:.1f}")
+        self._set_gauge("cur34", bus_i, "{:.2f}")
+        self._set_gauge("cur35", cmv, "{:.3f}")
+        # under the bus-current gauge show the differential volts; under the CM
+        # gauge note the ~1.44 V nominal. Both also feed the cal panel readouts.
+        if diffv == diffv:
+            self._gauges["cur34"][0].unit_lbl.config(text=f"A   ({diffv:+.3f} V)")
+            self._cur_vlbl["34"].config(text=f"{diffv:+.3f} V")
+            self._last_diffv = diffv
+        if cmv == cmv:
+            self._gauges["cur35"][0].unit_lbl.config(text="V  (~1.44 nom)")
+            self._cur_vlbl["35"].config(text=f"{cmv:.3f} V")
 
-        self._ch_rpm.add(rpm if rpm == rpm else float("nan"))
-        self._ch_power.add(power)
-        self._ch_tit.add(tc[0])
-        self._ch_coil.add(tc[3])
+        # Feed every chart from the signal registry (each chart plots whatever
+        # signal its dropdown selects).
+        self._sig = {
+            "RPM": rpm, "ESC Power [W]": power, "TIT [°C]": tc[0],
+            "EGT / Glow [°C]": tc[1], "Bearing [°C]": tc[2], "Coil [°C]": tc[3],
+            "DC Voltage [V]": esc_v, "DC Current [A]": esc_i,
+            "ESC Temp [°C]": esc_t, "Battery [%]": batt,
+            "Bus Current [A]": bus_i, "Sensor CM [V]": cmv,
+            "Fuel Flow [ml/min]": ff, "Throttle [%]": thr,
+        }
+        for chart, var in self._charts:
+            chart.add(self._sig.get(var.get(), float("nan")))
+
+        # Pixhawk page (guarded: a failure here must not kill the data loop)
+        try:
+            self._update_pixhawk(parts, fget)
+        except Exception:
+            pass
 
         # engine state
         st = parts.get("ENG", "")
@@ -1069,10 +1522,10 @@ class EngineDashboard(tk.Tk):
             "esc_temp_c": parts.get("ESC_T", ""),
             "throttle_pct": parts.get("THR", ""), "gov_on": parts.get("GOV", ""),
             "gov_sp": parts.get("GSP", ""), "pump1_pct": parts.get("P1", ""),
-            "pump2_pct": parts.get("P2", ""), "fuel_gs": parts.get("FF", ""),
+            "pump2_pct": parts.get("P2", ""), "fuel_mlmin": parts.get("FF", ""),
             "glow_on": parts.get("GLW", ""),
             "battery_pct": f"{batt:.1f}" if batt == batt else "",
-            "cur_a": parts.get("I_A", ""), "cur_b": parts.get("I_B", ""),
+            "bus_current_a": parts.get("I_A", ""), "sensor_cm_v": parts.get("I_BV", ""),
         }
         self._record_row()
 
@@ -1122,15 +1575,30 @@ class EngineDashboard(tk.Tk):
 
     # ── Periodic ──────────────────────────────────────────────────────────────
     def _tick_1s(self):
-        for ch in (self._ch_rpm, self._ch_power, self._ch_tit, self._ch_coil):
-            ch.redraw()
+        try:
+            self._tick_1s_body()
+        except Exception as e:
+            self._log(f"tick error: {e}", "fault")
+        finally:
+            self.after(1000, self._tick_1s)
+
+    def _tick_1s_body(self):
+        for chart, _ in self._charts:
+            try:
+                chart.redraw()
+            except Exception:
+                pass   # one bad chart must not stop the others
         if self._connect_t and self._worker and self._worker.is_alive():
             self._elapsed_lbl.config(
                 text=f"t = {int(time.time() - self._connect_t)} s")
-        alive = (time.time() - self._last_hb) < HB_TIMEOUT_S
-        if self._worker and self._worker.is_alive() and not alive:
-            self._status_lbl.config(text="●  No heartbeat!", fg=YELLOW)
-        self.after(1000, self._tick_1s)
+        # Heartbeat watchdog — must restore "Connected" once data flows again,
+        # otherwise the boot-window "No heartbeat!" sticks forever.
+        if self._worker and self._worker.is_alive():
+            alive = (time.time() - self._last_hb) < HB_TIMEOUT_S
+            if alive:
+                self._status_lbl.config(text="●  Connected", fg=GREEN)
+            else:
+                self._status_lbl.config(text="●  No heartbeat!", fg=YELLOW)
 
     def _log(self, text, tag=""):
         self._term.config(state="normal")

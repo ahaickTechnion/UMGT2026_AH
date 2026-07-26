@@ -171,7 +171,8 @@ eng stop                        normal shutdown: fuel+glow off → COOLDOWN spin
 eng abort | eng reset           immediate kill (latched FAULT) / clear fault
 eng manual                      manual mode (direct pump/glow/throttle, failsafes live)
 eng status | eng params         status dump / list parameters (PARAM:name=value)
-eng set <name> <value>          edit any sequence/limit/PID parameter live
+eng set <name> <value>          edit any sequence/limit/PID parameter (live RAM)
+eng save | eng defaults         persist params to ECU flash (survives reboot) / clear
 gov on|off | gov sp <rpm>       RPM governor (NI PID Advanced form, out 15-100%)
 gov gains <kc> <ti_min> <td_min>
 thr <0-100>                     manual engine throttle (slew via governor off)
