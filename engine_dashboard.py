@@ -525,10 +525,16 @@ class EngineDashboard(tk.Tk):
                    fg=CYAN).pack(side="left", fill="x", expand=True, padx=2)
         brow2 = tk.Frame(c4, bg=SURF)
         brow2.pack(fill="x", pady=(4, 0))
+        self._sbtn(brow2, "\U0001F50A Beep Cube", lambda: self._send("px beep"),
+                   fg=GREEN).pack(side="left", fill="x", expand=True, padx=2)
         self._sbtn(brow2, "Send heartbeat", lambda: self._send("px hb"),
                    fg=CYAN).pack(side="left", fill="x", expand=True, padx=2)
         self._sbtn(brow2, "Reset counters", lambda: self._send("px reset"),
                    fg=YELLOW).pack(side="left", fill="x", expand=True, padx=2)
+        tk.Label(c4, text="Beep Cube plays the Pixhawk buzzer — proves the "
+                          "ECU→Cube link works, not just Cube→ECU.",
+                 bg=SURF, fg=TEXT_DIM, font=FONT_UI_SML, justify="left").pack(
+                     anchor="w", pady=(4, 0))
 
         baudrow = tk.Frame(c4, bg=SURF)
         baudrow.pack(fill="x", pady=(6, 0))

@@ -687,6 +687,7 @@ void handleLineCommand(const String &command) {
 #define MAVMSG_COMMAND_LONG        76
 #define MAVMSG_ALTITUDE            141
 #define MAVMSG_NAMED_VALUE_FLOAT   251
+#define MAVMSG_PLAY_TUNE           258
 #define MAVMSG_GENERATOR_STATUS    373
 
 // CRC_EXTRA per message (from common.xml). A wrong value here silently drops
@@ -702,6 +703,7 @@ static uint8_t mavCrcExtra(uint32_t id) {
     case MAVMSG_COMMAND_LONG:        return 152;
     case MAVMSG_ALTITUDE:            return 47;
     case MAVMSG_NAMED_VALUE_FLOAT:   return 170;
+    case MAVMSG_PLAY_TUNE:           return 187;
     case MAVMSG_GENERATOR_STATUS:    return 117;
     default:                         return 0;   // unknown → we don't decode it
   }
@@ -818,6 +820,17 @@ static void pxRequestData() {
   pxSetMsgInterval(MAVMSG_SCALED_PRESSURE, 500000);   // 2 Hz
   pxSetMsgInterval(MAVMSG_ALTITUDE,        500000);   // 2 Hz
   pxLastReqMs = millis();
+}
+
+// PLAY_TUNE (258): make the Pixhawk buzzer sound. `tune` is an MML string
+// (ArduPilot ToneAlarm dialect). Great end-to-end TX test: if the Cube beeps,
+// our commands are reaching it, not just its telemetry reaching us.
+static void pxSendPlayTune(const char *mml) {
+  uint8_t p[32]; memset(p, 0, sizeof(p));   // core fields only (tune2 omitted)
+  p[0] = pxSysId ? pxSysId : 1;   // target_system
+  p[1] = 1;                        // target_component = autopilot (buzzer owner)
+  strncpy((char *)(p + 2), mml, 30);
+  mavSend(MAVMSG_PLAY_TUNE, p, sizeof(p));
 }
 
 static void pxSendNamedFloat(const char *name, float v) {
@@ -1784,6 +1797,17 @@ void handlePixhawk(String &command, int &pos) {
     return;
   }
   if (action == "hb") { pxSendHeartbeat(); Serial.println("Heartbeat sent"); return; }
+  if (action == "beep" || action == "tune") {
+    // Optional custom MML after the word (e.g. "px beep MFT200L4O4CDE"), else
+    // a default rising scale that's unmistakably a test tone.
+    String mml = cmdOriginalLine.substring(pos);
+    mml.trim();
+    if (mml.length() == 0) mml = "MFT200L8O4cdefgab>c";
+    pxSendPlayTune(mml.c_str());
+    Serial.printf("PLAY_TUNE sent to Pixhawk: \"%s\"%s\n", mml.c_str(),
+                  pxOnline() ? "" : "  (link offline — it won't be heard)");
+    return;
+  }
   if (action == "gen") {
     String sub = getNextToken(command, pos);
     if (sub == "on" || sub == "off") {
@@ -1817,7 +1841,7 @@ void handlePixhawk(String &command, int &pos) {
   }
 
   Serial.println("Usage: px status | px on|off | px baud <rate> | px req |");
-  Serial.println("       px hb | px gen [on|off] | px raw on|off | px reset");
+  Serial.println("       px hb | px beep [tune] | px gen [on|off] | px raw on|off | px reset");
 }
 
 // -----------------------------------------------------------------------------
