@@ -14,8 +14,10 @@
 #define DEBUG_BAUD        115200
 #define ECU_SERIAL_BAUD   115200
 
-#define PIN_UART2_RX      16   // U2_RXD (J2 pad 10)
-#define PIN_UART2_TX      17   // U2_TXD (J2 pad 9)
+// Pixhawk MAVLink UART on J21 / SERIAL 2 (U2). Solid keyed 3-pin connector.
+//   Cube TELEM1 TX (pin 2) -> U2 RX (GPIO16),  Cube RX (pin 3) -> U2 TX (GPIO17).
+#define PIN_UART2_RX      16   // U2_RXD (J21)
+#define PIN_UART2_TX      17   // U2_TXD (J21)
 
 // CAN / TWAI → ESC via SN65HVD230 on J12 (3V3, GND, CTX, CRX, CANH, CANL)
 // The ESC is a Hargrave microDRIVE LPi speaking DroneCAN (UAVCAN v0),
@@ -188,8 +190,10 @@ static uint8_t  s2Buf[64];
 static uint8_t  s2Len = 0;
 static uint32_t s2LastByteMs = 0;
 static bool     s2HexMode = false;
-// Cube Orange TELEM1 defaults to 57600 8N1 MAVLink — match it out of the box.
-#define PIXHAWK_TELEM_BAUD 57600
+// TELEM1 baud. The Cube's factory default is 57600, but on this rig 115200 is
+// the rate that links reliably, so that's our default (set SERIAL1_BAUD=115 on
+// the Cube to match). Change live with "px baud <rate>".
+#define PIXHAWK_TELEM_BAUD 115200
 static uint32_t serial2Baud = PIXHAWK_TELEM_BAUD;
 
 // Digital pot tracked wiper position (0..POT_STEPS-1). Reset to 0 at boot.
@@ -662,7 +666,7 @@ void handleLineCommand(const String &command) {
 }
 
 // =============================================================================
-// MAVLink — Pixhawk (Cube Orange) on Serial2 / J21, TELEM1, 57600 8N1
+// MAVLink — Pixhawk (Cube Orange) on Serial2 / J21, TELEM1, 115200 8N1
 //
 // Minimal hand-rolled codec (no external library). Handles both MAVLink v1
 // (0xFE) and v2 (0xFD) framing on receive, because ArduPilot may send either
@@ -680,6 +684,7 @@ void handleLineCommand(const String &command) {
 
 #define MAVMSG_HEARTBEAT           0
 #define MAVMSG_SYS_STATUS          1
+#define MAVMSG_GPS_RAW_INT         24
 #define MAVMSG_SCALED_PRESSURE     29
 #define MAVMSG_GLOBAL_POSITION_INT 33
 #define MAVMSG_REQUEST_DATA_STREAM 66
@@ -696,6 +701,7 @@ static uint8_t mavCrcExtra(uint32_t id) {
   switch (id) {
     case MAVMSG_HEARTBEAT:           return 50;
     case MAVMSG_SYS_STATUS:          return 124;
+    case MAVMSG_GPS_RAW_INT:         return 24;
     case MAVMSG_SCALED_PRESSURE:     return 115;
     case MAVMSG_GLOBAL_POSITION_INT: return 104;
     case MAVMSG_REQUEST_DATA_STREAM: return 148;
@@ -744,6 +750,8 @@ static float    pxPressAbs = NAN, pxPressDiff = NAN, pxBaroTempC = NAN;
 static float    pxAltAmsl = NAN, pxAltRel = NAN, pxClimb = NAN;
 static float    pxGroundSpd = NAN, pxAirSpd = NAN, pxVBatt = NAN;
 static int16_t  pxHeading = -1, pxBattRem = -1;
+static int16_t  pxGpsFix = -1, pxGpsSats = -1;   // -1 = never received
+static float    pxGpsHdop = NAN;
 
 #define PX_LINK_TIMEOUT_MS 3000
 static bool pxOnline() { return pxLastHbMs && (millis() - pxLastHbMs < PX_LINK_TIMEOUT_MS); }
@@ -819,6 +827,7 @@ static void pxRequestData() {
   pxRequestStream(1,  2, 1);   // RAW_SENSORS
   pxSetMsgInterval(MAVMSG_SCALED_PRESSURE, 500000);   // 2 Hz
   pxSetMsgInterval(MAVMSG_ALTITUDE,        500000);   // 2 Hz
+  pxSetMsgInterval(MAVMSG_GPS_RAW_INT,     500000);   // 2 Hz — GPS fix/sats
   pxLastReqMs = millis();
 }
 
@@ -927,6 +936,13 @@ static void pxHandleMessage() {
       pxVBatt   = mavU16(b + 14) / 1000.0f;       // mV → V
       pxBattRem = (int8_t)b[30];
       break;
+    case MAVMSG_GPS_RAW_INT: {                     // eph@20 fix_type@28 sats@29
+      pxGpsFix  = b[28];
+      pxGpsSats = b[29];
+      uint16_t eph = mavU16(b + 20);
+      pxGpsHdop = (eph == 0xFFFF) ? NAN : eph / 100.0f;   // 65535 = unknown
+      break;
+    }
     default: break;
   }
 }
@@ -1131,7 +1147,7 @@ void printHelp() {
   Serial.println("px status                     - Pixhawk MAVLink link + baro/altitude");
   Serial.println("px req                        - Re-request data streams from Pixhawk");
   Serial.println("px gen [on|off]               - Generator telemetry TX to Pixhawk");
-  Serial.println("px baud <rate>                - Serial2 baud (Cube TELEM1 = 57600)");
+  Serial.println("px baud <rate>                - Serial2 baud (default 115200)");
   Serial.println("px raw on|off                 - Echo raw Serial2 bytes (floods!)");
   Serial.println("serial2 send <text>           - Send raw text to Serial2 (Pixhawk)");
   Serial.println("serial2 baud <rate>           - Change Serial2 baud (Pixhawk telem = 57600)");
@@ -1751,8 +1767,9 @@ void handleSerial2(String &command, int &pos) {
 static void pxPrintStatus() {
   Serial.printf("Pixhawk MAVLink: parser=%s, link=%s\n",
                 pxEnabled ? "on" : "off", pxOnline() ? "ONLINE" : "offline");
-  Serial.printf("  Serial2: %u baud on RX=GPIO%u TX=GPIO%u (J21)\n",
-                serial2Baud, PIN_UART2_RX, PIN_UART2_TX);
+  Serial.printf("  Serial2: %u baud on RX=GPIO%u TX=GPIO%u (%s)\n",
+                serial2Baud, PIN_UART2_RX, PIN_UART2_TX,
+                (PIN_UART2_RX == 16) ? "J21" : (PIN_UART2_RX == 14) ? "J22" : "custom");
   if (pxLastHbMs)
     Serial.printf("  Heartbeat: sys=%u comp=%u MAVLink v%u, age=%lu ms\n",
                   pxSysId, pxCompId, pxMavVer, millis() - pxLastHbMs);
@@ -1767,6 +1784,7 @@ static void pxPrintStatus() {
   Serial.printf("  Speed: gnd %.2f m/s, air %.2f m/s, hdg %d deg\n",
                 pxGroundSpd, pxAirSpd, pxHeading);
   Serial.printf("  Batt:  %.2f V, %d%%\n", pxVBatt, pxBattRem);
+  Serial.printf("  GPS:   fix=%d sats=%d HDOP=%.2f\n", pxGpsFix, pxGpsSats, pxGpsHdop);
   Serial.printf("  Generator TX: %s\n", pxGenTx ? "on" : "off");
 }
 
@@ -1785,10 +1803,10 @@ void handlePixhawk(String &command, int &pos) {
     if (baud >= 1200 && baud <= 1000000) {
       serial2Baud = (uint32_t)baud;
       Serial2.updateBaudRate(serial2Baud);
-      Serial.printf("Serial2 baud set to %u (Cube TELEM1 default is 57600)\n", serial2Baud);
+      Serial.printf("Serial2 baud set to %u (this rig links at 115200)\n", serial2Baud);
       return;
     }
-    Serial.println("Usage: px baud <1200-1000000>  (TELEM1 default 57600)");
+    Serial.println("Usage: px baud <1200-1000000>  (default 115200)");
     return;
   }
   if (action == "req") {
@@ -1834,7 +1852,8 @@ void handlePixhawk(String &command, int &pos) {
     pxLastHbMs = pxLastMsgMs = 0;
     pxPressAbs = pxPressDiff = pxBaroTempC = NAN;
     pxAltAmsl = pxAltRel = pxClimb = pxGroundSpd = pxAirSpd = pxVBatt = NAN;
-    pxHeading = pxBattRem = -1;
+    pxHeading = pxBattRem = pxGpsFix = pxGpsSats = -1;
+    pxGpsHdop = NAN;
     pxSysId = pxCompId = pxMavVer = 0;
     Serial.println("Pixhawk counters and cached telemetry cleared");
     return;
@@ -3636,6 +3655,8 @@ void sendStreamData() {
   if (!isnan(pxGroundSpd)) Serial.printf(",PX_GS=%.2f", pxGroundSpd);
   if (!isnan(pxVBatt))     Serial.printf(",PX_VBAT=%.2f", pxVBatt);
   if (pxHeading >= 0)      Serial.printf(",PX_HDG=%d", pxHeading);
+  if (pxGpsFix >= 0)       Serial.printf(",PX_FIX=%d,PX_SATS=%d", pxGpsFix, pxGpsSats);
+  if (!isnan(pxGpsHdop))   Serial.printf(",PX_HDOP=%.2f", pxGpsHdop);
 
   Serial.println();
 }
@@ -3784,6 +3805,9 @@ void setMosfetFrequency(uint32_t frequency) {
 void initializeSerial() {
   Serial.begin(DEBUG_BAUD);
   while (!Serial) { ; }
+  // Bigger RX buffer (default 256 B) so a busy main loop can't drop Pixhawk
+  // bytes between service calls — rules out the ESP32 side of any corruption.
+  Serial2.setRxBufferSize(2048);
   Serial2.begin(serial2Baud, SERIAL_8N1, PIN_UART2_RX, PIN_UART2_TX);
   Serial.println("Serial ports initialized");
 }

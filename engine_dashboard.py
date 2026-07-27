@@ -422,7 +422,7 @@ class EngineDashboard(tk.Tk):
               foreground=[("selected", ACCENT), ("active", TEXT)])
 
     # ── Pixhawk / MAVLink page ───────────────────────────────────────────────
-    # Cube Orange on TELEM1 → J21 (ESP32 Serial2, GPIO16/17) at 57600 8N1.
+    # Cube Orange on TELEM1 → J21 / U2 (ESP32 Serial2, GPIO16/17) at 115200 8N1.
     # The ESP32 does the MAVLink decoding and republishes the values as PX_* keys
     # in the DATA stream, so this page is a pure view over those keys.
     def _build_pixhawk_page(self, parent):
@@ -462,6 +462,18 @@ class EngineDashboard(tk.Tk):
                          width=9, anchor="w")
             v.pack(anchor="w")
             self._px_stats[key] = v
+
+        # ---- GPS status (big go/no-go indicator) ----------------------------
+        cg = card(col_l, "GPS")
+        cg.master.pack(fill="x", pady=(6, 0))
+        grow = tk.Frame(cg, bg=SURF)
+        grow.pack(fill="x")
+        self._px_gps = tk.Label(grow, text="● GPS ---", bg=SURF, fg=TEXT_DIM,
+                                font=("Segoe UI", 15, "bold"))
+        self._px_gps.pack(side="left")
+        self._px_gps_sub = tk.Label(grow, text="no GPS data yet", bg=SURF,
+                                    fg=TEXT_DIM, font=FONT_UI_SML)
+        self._px_gps_sub.pack(side="left", padx=12)
 
         # ---- barometer + altitude -------------------------------------------
         c2 = card(col_l, "Barometer / Altitude  (from Pixhawk)")
@@ -540,16 +552,16 @@ class EngineDashboard(tk.Tk):
         baudrow.pack(fill="x", pady=(6, 0))
         tk.Label(baudrow, text="Baud", bg=SURF, fg=TEXT_DIM,
                  font=FONT_UI_SML).pack(side="left")
-        self._px_baud = tk.StringVar(value="57600")
+        self._px_baud = tk.StringVar(value="115200")
         ttk.Combobox(baudrow, textvariable=self._px_baud, state="readonly", width=9,
-                     values=["57600", "115200", "921600", "38400", "19200"]
+                     values=["115200", "57600", "921600", "38400", "19200"]
                      ).pack(side="left", padx=4)
         self._sbtn(baudrow, "Apply",
                    lambda: self._send(f"px baud {self._px_baud.get()}"),
                    fg=GREEN).pack(side="left", padx=2)
-        tk.Label(c4, text="Cube TELEM1 default is 57600. If there's no link, check "
-                          "GND/RX↔TX are crossed and\nset BRD_SER1_RTSCTS=0 (no flow "
-                          "control on a 3-wire hookup).",
+        tk.Label(c4, text="This rig links at 115200 (set SERIAL1_BAUD=115 on the Cube). "
+                          "If there's no link, check\nGND/RX↔TX are crossed and set "
+                          "BRD_SER1_RTSCTS=0 (no flow control on a 3-wire hookup).",
                  bg=SURF, fg=TEXT_DIM, font=FONT_UI_SML, justify="left").pack(
                      anchor="w", pady=(6, 0))
 
@@ -612,6 +624,36 @@ class EngineDashboard(tk.Tk):
         self._px_stats["tx"].config(text=parts.get("PX_TX", "---"))
         hb = parts.get("PX_HB", "")
         self._px_stats["hb"].config(text=f"{hb} ms" if hb else "---")
+
+        # ---- GPS go/no-go -------------------------------------------------
+        # fix: 0=no GPS 1=no fix 2=2D 3=3D 4=DGPS 5=RTK-float 6=RTK-fixed
+        FIXNAME = {0: "no GPS", 1: "no fix", 2: "2D fix", 3: "3D fix",
+                   4: "DGPS", 5: "RTK float", 6: "RTK fixed", 8: "static"}
+        try:
+            fix = int(parts.get("PX_FIX", "-1"))
+        except ValueError:
+            fix = -1
+        try:
+            sats = int(parts.get("PX_SATS", "-1"))
+        except ValueError:
+            sats = -1
+        hdop = fget("PX_HDOP")
+        if fix < 0:                       # never received
+            txt, color, sub = "● GPS ---", TEXT_DIM, "no GPS data yet"
+        elif fix >= 3 and sats >= 6 and (hdop != hdop or hdop < 2.0):
+            txt, color = "● GPS GOOD", GREEN
+        elif fix >= 2:                    # 2D, or 3D but marginal sats/HDOP
+            txt, color = "● GPS WEAK", YELLOW
+        else:                             # 0/1 = no fix / no GPS
+            txt, color = "● GPS BAD", RED
+        if fix >= 0:
+            sub = FIXNAME.get(fix, f"fix {fix}")
+            if sats >= 0:
+                sub += f"  ·  {sats} sats"
+            if hdop == hdop:
+                sub += f"  ·  HDOP {hdop:.1f}"
+        self._px_gps.config(text=txt, fg=color)
+        self._px_gps_sub.config(text=sub, fg=color if fix >= 0 else TEXT_DIM)
 
         vals = {
             "press": fget("PX_PRESS"), "ptemp": fget("PX_PTEMP"),
@@ -1589,7 +1631,10 @@ class EngineDashboard(tk.Tk):
             self.after(1000, self._tick_1s)
 
     def _tick_1s_body(self):
-        for chart, _ in self._charts:
+        # Redraw BOTH the Engine-page charts and the Pixhawk-page charts. The
+        # Pixhawk trend charts used to be left out of this loop, so they only
+        # repainted on resize/tab-switch and looked frozen.
+        for chart, _ in list(self._charts) + list(getattr(self, "_px_charts", [])):
             try:
                 chart.redraw()
             except Exception:
