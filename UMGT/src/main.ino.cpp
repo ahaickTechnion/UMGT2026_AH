@@ -228,6 +228,10 @@ struct EscTelemetry {
 };
 static EscTelemetry esc = {};
 
+// Shaft RPM to use everywhere. DroneCAN's ESC Status caps RPM at int18 (131071);
+// past that we switch to a throttle→RPM model (100% = 150k). See updateEscRpm().
+static int32_t escRpmExt = 0;
+
 // Hargrave error_count bitfield names (bits 0-12), from the microDRIVE docs
 static const char *escErrorNames[13] = {
   "OVER_TEMP", "BUS_OVERCURRENT", "PHASE_OVERCURRENT", "OVER_VOLT", "UNDER_VOLT",
@@ -338,6 +342,22 @@ static const char *escCmdModeNames[] = { "OFF", "DUTY", "RPM", "BRK" };
 static float    tcTemp[4] = { NAN, NAN, NAN, NAN };
 static uint32_t tcRaw[4]  = { 0, 0, 0, 0 };
 
+// Coil (TC4) noise filter state — the coil TC sits inside the electric motor
+// and picks up heavy EMI, so only that channel is median-filtered. See
+// filterCoil() near readAllThermocouples(). Window is tunable: "tc filter <n>".
+#define COIL_IDX            3
+#define COIL_MED_MAX        31
+#define COIL_FAULT_HOLD_MS  1500
+static uint8_t  coilMedN = 15;         // median window length (1..COIL_MED_MAX)
+static float    coilSlewMax = 2.5f;    // max °C change per sample after median —
+                                       // backstop for spikes the median misses;
+                                       // 25 °C/s @10Hz, far above real coil heating
+static float    coilMedBuf[COIL_MED_MAX];
+static uint8_t  coilMedCount = 0, coilMedHead = 0;
+static float    coilFiltered = NAN;
+static uint32_t coilLastValidMs = 0;
+static void coilFilterReset() { coilMedCount = coilMedHead = 0; coilFiltered = NAN; }
+
 // -----------------------------------------------------------------------------
 // Forward declarations
 // -----------------------------------------------------------------------------
@@ -442,6 +462,7 @@ float    engineFuelFlowGs();
 void     engineAllSafe();
 void     governorReset();
 void     governorTick(float dt);
+void     updateEscRpm();
 void     engineTick();
 void     engineStatusPrint();
 void     handleEng(String &command, int &pos);
@@ -524,6 +545,7 @@ void loop() {
   processSerial2Bridge();
   pxTask();
   processCanRx();
+  updateEscRpm();       // extend shaft RPM past the ESC's int18 cap
   canThrottleTask();
   nodeStatusTask();
   armingStatusTask();
@@ -888,7 +910,7 @@ static void pxSendEngineValues() {
   if (!isnan(tcTemp[0])) pxSendNamedFloat("TIT", tcTemp[0]);
   pxSendNamedFloat("FUELFLOW", engineFuelFlowMlMin());
   pxSendNamedFloat("BUSCUR", currentBusAmps());
-  if (esc.seen) pxSendNamedFloat("SHAFTRPM", (float)esc.rpm);
+  if (esc.seen) pxSendNamedFloat("SHAFTRPM", (float)escRpmExt);
 }
 
 // ---- receive parser (v1 + v2) ----
@@ -1110,6 +1132,7 @@ void printHelp() {
   Serial.println("tc read all                   - Read all 4 thermocouples");
   Serial.println("tc scan                       - Probe all 16 expander CS bits (diagnostics)");
   Serial.println("tc mode 31855|6675            - Select thermocouple chip decode");
+  Serial.println("tc filter <n>                 - Coil TC (4) median filter window (motor EMI)");
   Serial.println("current all                   - Read SSA-2 bus current + leg volts");
   Serial.println("current cal <zeroV> <A_per_V> - Set current cal (SSA-2-100A: 0 80)");
   Serial.println("pot pos                       - Show tracked digital pot position (0-99)");
@@ -1237,8 +1260,27 @@ void handleThermocouple(String &command, int &pos) {
                   tcMode6675 ? "MAX6675" : "MAX31855");
     return;
   }
+  if (action == "filter") {
+    // Coil (TC4) noise filter window. "tc filter" shows it; "tc filter <n>" sets
+    // the running-median length (1 = effectively off, higher = more rejection
+    // but more lag). Only the coil channel is filtered.
+    String sub = getNextToken(command, pos);
+    if (sub.length() > 0) {
+      int n = sub.toInt();
+      if (n < 1) n = 1;
+      if (n > COIL_MED_MAX) n = COIL_MED_MAX;
+      coilMedN = (uint8_t)n;
+      coilFilterReset();
+      Serial.printf("Coil (TC4) median filter set to %u samples (%.1f s @ %u Hz)\n",
+                    coilMedN, coilMedN * (TC_SAMPLE_MS / 1000.0f), 1000 / TC_SAMPLE_MS);
+      return;
+    }
+    Serial.printf("Coil (TC4) median filter: %u samples + slew %.1f C/sample (usage: tc filter <1-%u>)\n",
+                  coilMedN, coilSlewMax, COIL_MED_MAX);
+    return;
+  }
   if (action != "read") {
-    Serial.println("Usage: tc read <1-4|all> | tc scan | tc mode 31855|6675");
+    Serial.println("Usage: tc read <1-4|all> | tc scan | tc mode 31855|6675 | tc filter <n>");
     return;
   }
 
@@ -1923,11 +1965,64 @@ float decodeTc(uint32_t raw) {
   return tcMode6675 ? decodeMAX6675Celsius(raw) : decodeMAX31855Celsius(raw);
 }
 
+// -----------------------------------------------------------------------------
+// Coil thermocouple noise filter (channel index 3 only).
+// The coil TC lives INSIDE the electric motor, so motor EMI injects sharp
+// bipolar spikes (and occasional bogus MAX31855 fault bits) during running. The
+// other three TCs sit outside the motor and read clean, so only this channel is
+// filtered. A running median rejects the impulsive spikes (temperature is slow,
+// so the median stays locked on the true value where an average would just
+// smear the spikes in); a light EMA then smooths the residual. A transient fault
+// is held at the last good value for COIL_FAULT_HOLD_MS so an EMI glitch can't
+// blink the reading to OPEN/SGND. Window is tunable live: "tc filter <n>".
+// (State + coilFilterReset() are declared up near tcTemp[] so the command
+// handler can reach them.)
+// -----------------------------------------------------------------------------
+static float coilMedian() {
+  float tmp[COIL_MED_MAX];
+  for (uint8_t i = 0; i < coilMedCount; i++) tmp[i] = coilMedBuf[i];
+  for (uint8_t i = 1; i < coilMedCount; i++) {   // insertion sort (tiny N)
+    float v = tmp[i]; int8_t j = (int8_t)i - 1;
+    while (j >= 0 && tmp[j] > v) { tmp[j + 1] = tmp[j]; j--; }
+    tmp[j + 1] = v;
+  }
+  return tmp[coilMedCount / 2];
+}
+
+static float filterCoil(float decoded) {
+  uint32_t now = millis();
+  if (!isnan(decoded)) {
+    coilMedBuf[coilMedHead] = decoded;
+    coilMedHead = (coilMedHead + 1) % coilMedN;
+    if (coilMedCount < coilMedN) coilMedCount++;
+    coilLastValidMs = now;
+    float med = coilMedian();
+    if (isnan(coilFiltered)) {
+      coilFiltered = med;
+    } else {
+      // slew-limit toward the median: a real temperature change is gradual and
+      // passes through, but a big spike that leaked past the median can only
+      // nudge the output by coilSlewMax and gets pulled back next sample.
+      float d = med - coilFiltered;
+      if (d >  coilSlewMax) d =  coilSlewMax;
+      if (d < -coilSlewMax) d = -coilSlewMax;
+      coilFiltered += d;
+    }
+    return coilFiltered;
+  }
+  // Fault sample: hold the last good value briefly — EMI trips fault bits too.
+  if (coilLastValidMs && now - coilLastValidMs < COIL_FAULT_HOLD_MS)
+    return coilFiltered;
+  coilFilterReset();     // persistent fault → genuinely disconnected, report it
+  return NAN;
+}
+
 void readAllThermocouples() {
   for (uint8_t i = 0; i < 4; i++) {
     tcRaw[i]  = readMAX31855(tcExpBits[i]);
     tcTemp[i] = decodeTc(tcRaw[i]);
   }
+  tcTemp[COIL_IDX] = filterCoil(tcTemp[COIL_IDX]);   // coil channel only
 }
 
 // Print one TC line with fault detail and cold-junction temp when faulted.
@@ -2809,7 +2904,7 @@ void printEscTelemetry() {
   }
   Serial.printf("ESC (node %u, index %u), last seen %lu ms ago:\n",
                 esc.srcNode, esc.escIndex, millis() - esc.lastMs);
-  Serial.printf("  RPM: %d\n", esc.rpm);
+  Serial.printf("  RPM: %d\n", escRpmExt);
   Serial.printf("  Voltage: %.2f V\n", esc.voltage);
   Serial.printf("  Current: %.2f A\n", esc.current);
   Serial.printf("  Bridge temp: %.1f C\n", esc.tempC);
@@ -3103,15 +3198,35 @@ void engineFault(EngFault f) {
 
 // ---- PID governor ------------------------------------------------------------
 // u = Kc*e + (Kc/Ti)∫e dt + Kc*Td*d(-pv)/dt, Ti/Td in minutes as in LabVIEW.
+// The ESC's DroneCAN RPM field caps at int18 (131071). Below the cap we use the
+// measured ESC RPM; at/above the cap we switch to the throttle→RPM model fitted
+// from bench data (555 samples, throttle 2–43%): RPM = 2940.21*thr − 1094,
+// R² = 0.993. The fit crosses 130k at ~44.6% throttle — right where the ESC
+// clips (~45%) — so the handoff is seamless. max(model,measured) prevents any
+// dip below the cap value. Extrapolates linearly above (100% ≈ 293k RPM).
+#define RPM_SWITCH_RPM   130000        // measured value at/above which we model
+#define RPM_MODEL_A      2940.21f      // RPM per % throttle (slope)
+#define RPM_MODEL_B      (-1094.1f)    // intercept
+
+void updateEscRpm() {
+  int32_t measured = esc.seen ? esc.rpm : 0;
+  if (esc.seen && measured >= RPM_SWITCH_RPM) {
+    int32_t model = (int32_t)(RPM_MODEL_A * engThrottle + RPM_MODEL_B);
+    escRpmExt = (model > measured) ? model : measured;   // never below the cap
+  } else {
+    escRpmExt = measured;
+  }
+}
+
 // Anti-windup by back-calculation at the clamps, derivative on PV, and a slew
 // limiter on the throttle output (the LabVIEW "limiting to avoid glitching").
 void governorReset() {
   govI = constrain(engThrottle, ep.gov_min, ep.gov_max);  // bumpless engage
-  govPrevPv = esc.seen ? (float)esc.rpm : 0;
+  govPrevPv = esc.seen ? (float)escRpmExt : 0;
 }
 
 void governorTick(float dt) {
-  float pv = esc.seen ? (float)esc.rpm : 0;
+  float pv = esc.seen ? (float)escRpmExt : 0;
   float e  = govSp - pv;
   float Ti = ep.gov_ti * 60.0f;
   float Td = ep.gov_td * 60.0f;
@@ -3144,7 +3259,7 @@ void engineTick() {
   float glowT   = tcTemp[1];
   float bearing = tcTemp[2];
   float coil    = tcTemp[3];
-  float rpm     = esc.seen ? (float)esc.rpm : 0;
+  float rpm     = esc.seen ? (float)escRpmExt : 0;
 
   // Fuel shutoff is absolute — enforce every tick
   if (fuelCut && (pumpPct[0] > 0 || pumpPct[1] > 0)) {
@@ -3616,7 +3731,7 @@ void sendStreamData() {
   // look like live readings. ESC_LOST=1 tells the exe to blank the tiles.
   if (esc.seen && millis() - esc.lastMs < ESC_TELEM_TIMEOUT_MS) {
     Serial.printf("ESC_RPM=%d,ESC_V=%.2f,ESC_I=%.2f,ESC_T=%.1f,ESC_PWR=%u,",
-                  esc.rpm, esc.voltage, esc.current, esc.tempC, esc.powerPct);
+                  escRpmExt, esc.voltage, esc.current, esc.tempC, esc.powerPct);
     Serial.printf("ESC_ERR=%X,ESC_AGE=%lu,", esc.errorFlags, millis() - esc.lastMs);
     if (esc.extSeen) {
       Serial.printf("ESC_IN=%u,ESC_OUT=%u,ESC_MT=%d,", esc.inputPct, esc.outputPct, esc.motorTempC);
