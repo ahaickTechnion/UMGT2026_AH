@@ -451,7 +451,7 @@ void     pumpSet(uint8_t idx, float pct);
 float    pctToFlow(float pct);
 float    pumpPctForFlow(float mlmin);
 void     glowSet(bool on);
-void     solSet(uint8_t idx, bool on);
+void     solSet(uint8_t idx, float pct);
 void     handleSol(String &command, int &pos);
 void     engineParamsSave();
 bool     engineParamsLoad();
@@ -1186,7 +1186,8 @@ void printHelp() {
   Serial.println("ramp up|down|pause|off        - Throttle ramp; ramp rate <pct/s>");
   Serial.println("pump <1|2> <0-100>            - Fuel pump duty (fine PWM); pump stop");
   Serial.println("glow on|off                   - Glow plug (M1/GPIO32)");
-  Serial.println("sol <1|2> on|off              - Solenoid 1 (M3/GPIO25) / 2 (M2/GPIO33)");
+  Serial.println("sol <1|2> <0-100|on|off>      - Solenoid PWM duty (0=closed, 100=full open)");
+  Serial.println("sol invert <1|2>              - Flip signal polarity (sol1=AMT high-on default)");
   Serial.println("fuel cut on|off               - Fuel shutoff latch (pumps forced 0)");
 }
 
@@ -3136,17 +3137,28 @@ void glowSet(bool on) {
   setMosfetDuty(MOSFET_IDX_GLOW, on ? 10 : 0);   // M1/GPIO32, plain on/off switch
 }
 
-// Solenoids on M3(GPIO25, sol1) and M2(GPIO33, sol2). "On" drives sol_duty%
-// PWM (default 50% ~= 6V on a 12V bus) — the 10kHz carrier averages through
-// the coil inductance so the solenoid sees ~6V. Tune sol_duty to hit exactly.
-static bool solOn[2] = { false, false };
-void solSet(uint8_t idx, bool on) {
+// Solenoids on M3(GPIO25, sol1) and M2(GPIO33, sol2), PWM DUTY control:
+// 0% = closed (zero pass), 100% = fully open (full pass), fine steps between.
+// The 10kHz carrier averages through the coil inductance so the coil sees
+// duty% of the 12V bus (e.g. 50% ~= 6V). solDuty holds each solenoid's duty.
+static float solDuty[2] = { 0.0f, 0.0f };
+// Per-solenoid signal polarity. sol1 drives a 12V AMT "high-on" solenoid through
+// its signal wire on the (low-side) MOSFET output: the valve is OPEN when the
+// signal is HIGH, and the MOSFET pulls the signal LOW when it conducts — so the
+// control is INVERTED (MOSFET duty = 100 - open%). solDuty always holds the
+// intuitive "open %" (0 = closed, 100 = full open); the inversion is hidden here.
+// At the endpoints the signal is a clean steady level (0% = steady low = closed,
+// 100% = steady high = open); values between are PWM. Flip a channel live with
+// "sol invert <1|2>" if its wiring turns out to be the opposite polarity.
+static bool solInvert[2] = { true, false };   // sol1 = AMT high-on signal, sol2 = direct
+void solSet(uint8_t idx, float pct) {
   if (idx > 1) return;
-  solOn[idx] = on;
+  pct = constrain(pct, 0.0f, 100.0f);
+  solDuty[idx] = pct;                                 // logical open %
+  float hw = solInvert[idx] ? (100.0f - pct) : pct;   // actual MOSFET duty
   uint8_t m = (idx == 0) ? MOSFET_IDX_SOL1 : MOSFET_IDX_SOL2;
-  float pct = on ? constrain(ep.sol_duty, 0.0f, 100.0f) : 0.0f;
-  ledcWrite(mosfetChannels[m], (uint32_t)(pct * 255.0f / 100.0f));
-  mosfetDuty[m] = (uint8_t)(pct / 10.0f + 0.5f);   // keep M display sane
+  ledcWrite(mosfetChannels[m], (uint32_t)(hw * 255.0f / 100.0f));
+  mosfetDuty[m] = (uint8_t)(hw / 10.0f + 0.5f);       // M display shows real duty
 }
 
 // Engine throttle → ESC duty command (via the existing 50 Hz DroneCAN sender)
@@ -3173,8 +3185,8 @@ void engineAllSafe() {
   pumpSet(0, 0);
   pumpSet(1, 0);
   glowSet(false);
-  solSet(0, false);
-  solSet(1, false);
+  solSet(0, 0.0f);
+  solSet(1, 0.0f);
   govOn = false;
   rampMode = RAMP_OFF;
   engThrottle = 0;
@@ -3556,14 +3568,33 @@ void handleGlow(String &command, int &pos) {
 // Solenoid 1 = M3/GPIO25, solenoid 2 = M2/GPIO33
 void handleSol(String &command, int &pos) {
   String which = getNextToken(command, pos);
+  if (which == "invert") {
+    int n = getNextToken(command, pos).toInt();
+    if (n == 1 || n == 2) {
+      solInvert[n - 1] = !solInvert[n - 1];
+      solSet(n - 1, solDuty[n - 1]);   // re-apply current open% with new polarity
+      Serial.printf("Solenoid %d signal polarity: %s\n", n,
+                    solInvert[n - 1] ? "INVERTED (high-on)" : "direct");
+      return;
+    }
+    Serial.println("Usage: sol invert <1|2>");
+    return;
+  }
   int idx = which.toInt();
   if (idx == 1 || idx == 2) {
     String action = getNextToken(command, pos);
-    if (action == "on")  { solSet(idx - 1, true);  Serial.printf("Solenoid %d ON\n", idx);  return; }
-    if (action == "off") { solSet(idx - 1, false); Serial.printf("Solenoid %d OFF\n", idx); return; }
+    if (action == "on")  { solSet(idx - 1, ep.sol_duty); Serial.printf("Solenoid %d -> %.0f%% (on)\n", idx, ep.sol_duty); return; }
+    if (action == "off") { solSet(idx - 1, 0.0f);        Serial.printf("Solenoid %d OFF (0%%)\n", idx);            return; }
+    // numeric duty: "sol 1 37" -> 37% PWM
+    if (action.length() > 0 && (isDigit(action[0]) || action[0] == '.')) {
+      solSet(idx - 1, action.toFloat());
+      Serial.printf("Solenoid %d duty %.1f%%\n", idx, solDuty[idx - 1]);
+      return;
+    }
   }
-  Serial.printf("Solenoids: 1=%s 2=%s, on-duty=%.0f%% (usage: sol <1|2> on|off)\n",
-                solOn[0] ? "ON" : "OFF", solOn[1] ? "ON" : "OFF", ep.sol_duty);
+  Serial.printf("Solenoids: 1=%.1f%%(%s) 2=%.1f%%(%s)  (usage: sol <1|2> <0-100|on|off> | sol invert <1|2>)\n",
+                solDuty[0], solInvert[0] ? "inv" : "dir",
+                solDuty[1], solInvert[1] ? "inv" : "dir");
 }
 
 void handleRamp(String &command, int &pos) {
@@ -3746,9 +3777,9 @@ void sendStreamData() {
   Serial.printf("ENG=%s,FLT=%s,GLW=%d,P1=%.1f,P2=%.1f,FF=%.1f,",
                 engStateNames[engState], engFaultNames[engFault],
                 glowOn ? 1 : 0, pumpPct[0], pumpPct[1], engineFuelFlowMlMin());
-  Serial.printf("GOV=%d,GSP=%.0f,THR=%.1f,FCUT=%d,RMP=%s,SOL1=%d,SOL2=%d,",
+  Serial.printf("GOV=%d,GSP=%.0f,THR=%.1f,FCUT=%d,RMP=%s,SOL1=%.1f,SOL2=%.1f,",
                 govOn ? 1 : 0, govSp, engThrottle, fuelCut ? 1 : 0,
-                rampModeNames[rampMode], solOn[0] ? 1 : 0, solOn[1] ? 1 : 0);
+                rampModeNames[rampMode], solDuty[0], solDuty[1]);
 
   for (uint8_t i = 0; i < 5; i++) {
     Serial.printf("M%u=%u", i + 1, mosfetDuty[i]);
@@ -3980,6 +4011,12 @@ void initializeTestController() {
     ledcAttachPin(mosfetPins[i], mosfetChannels[i]);
     ledcWrite(mosfetChannels[i], 0);
   }
+  // Boot-safe: force both solenoids CLOSED immediately. sol1 is a high-on signal
+  // solenoid (inverted), so "closed" = MOSFET full-on pulling the signal LOW —
+  // this must be set explicitly, or it would sit OPEN at power-up (MOSFET off →
+  // signal floats high → valve open).
+  solSet(0, 0.0f);
+  solSet(1, 0.0f);
 
   // Expander: find it, then set all outputs HIGH (all CS deasserted)
   expanderDetect();
