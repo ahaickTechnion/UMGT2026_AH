@@ -3150,7 +3150,8 @@ static float solDuty[2] = { 0.0f, 0.0f };
 // At the endpoints the signal is a clean steady level (0% = steady low = closed,
 // 100% = steady high = open); values between are PWM. Flip a channel live with
 // "sol invert <1|2>" if its wiring turns out to be the opposite polarity.
-static bool solInvert[2] = { true, false };   // sol1 = AMT high-on signal, sol2 = direct
+//static bool solInvert[2] = { false, false };   // sol1 = direct (NC), sol2 = direct(NC)
+static bool solInvert[2] = { true, false };      // sol1 = AMT high-on signal (NO), sol2 = direct (NC)
 void solSet(uint8_t idx, float pct) {
   if (idx > 1) return;
   pct = constrain(pct, 0.0f, 100.0f);
