@@ -7,12 +7,11 @@ pause
 :: Install dependencies if not already installed
 pip install pyserial pyinstaller
 
-:: Build each dashboard from its spec file (matches how they are released).
-:: --noconfirm overwrites the previous dist\*.exe without prompting.
 echo.
 echo --- Building UMGT_Engine.exe (engine_dashboard.py) ---
+echo.
 
-pyinstaller --noconfirm UMGT_Engine.spec
+pyinstaller --clean --noconfirm UMGT_Engine.spec
 
 echo.
 echo Build complete ==> dist\UMGT_Engine.exe

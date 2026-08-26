@@ -26,6 +26,7 @@ import collections
 import csv
 import tkinter as tk
 from tkinter import ttk, scrolledtext, messagebox, filedialog
+from tkinter import font as tkfont
 import serial
 import serial.tools.list_ports
 
@@ -652,6 +653,20 @@ class EngineDashboard(tk.Tk):
         self._speed_active = False
         self._speed_guard = 0.0
 
+        # every Events/Terminal widget built (Engine page + ESC/Console page);
+        # _log() writes the same line to all of them
+        self._terms = []
+        self._log_win = None
+
+        # ESC parameter request in flight (name we asked for + deadline), and
+        # commands recently sent, whose echoes we swallow
+        self._escp_want = None
+        self._escp_until = 0.0
+        self._escp_seen = 0
+        self._last_parts = {}
+        self._int_watch_job = None
+        self._echo_recent = {}
+
         # latest values for CSV logging
         self._latest = {}
         self._recording = False
@@ -749,8 +764,10 @@ class EngineDashboard(tk.Tk):
 
         page_eng = tk.Frame(nb, bg=BG)
         page_px  = tk.Frame(nb, bg=BG)
+        page_esc = tk.Frame(nb, bg=BG)
         nb.add(page_eng, text="  Engine  ")
         nb.add(page_px,  text="  Pixhawk  ")
+        nb.add(page_esc, text="  ESC / Console  ")
 
         # Three columns split by DRAGGABLE dividers (a PanedWindow). Grab either
         # sash — the cursor turns into a ↔ — and drag to give a column more or
@@ -763,7 +780,17 @@ class EngineDashboard(tk.Tk):
 
         left = tk.Frame(top, bg=BG)       # graphs
         mid = tk.Frame(top, bg=BG)        # ESC + fuel controls
-        right = tk.Frame(top, bg=BG)      # sequencer + params + log
+        # The right column gets its own HORIZONTAL sash from `top` and a
+        # VERTICAL one inside it: drag the divider above Events/Terminal to
+        # trade panel height for log height. Without it the log is whatever
+        # scraps the panels above leave over.
+        right = tk.PanedWindow(top, orient="vertical", bg="#39406a",
+                               sashwidth=8, sashrelief="flat", bd=0,
+                               sashpad=0, opaqueresize=True)
+        right_top = tk.Frame(right, bg=BG)   # sequencer + params + ESC + ECU
+        right_bot = tk.Frame(right, bg=BG)   # log
+        right.add(right_top, minsize=120, stretch="always")
+        right.add(right_bot, minsize=60, height=170, stretch="never")
         # Charts pane absorbs spare space on resize; the two control columns keep
         # their width (and their buttons legible) unless you drag a sash.
         top.add(left,  minsize=240, width=560, stretch="always")
@@ -774,11 +801,13 @@ class EngineDashboard(tk.Tk):
         self._build_esc_panel(mid)
         self._build_fuel_panel(mid)
         self._build_current_cal(mid)
-        self._build_seq_panel(right)
-        self._build_param_panel(right)
-        self._build_esc_params(right)
-        self._build_log(right)
+        self._build_seq_panel(right_top)
+        self._build_param_panel(right_top)
+        self._build_esc_params(right_top)
+        self._build_internal_panel(right_top, compact=True)
+        self._build_log(right_bot)
         self._build_pixhawk_page(page_px)
+        self._build_console_page(page_esc)
         self._build_gauges(bottom)        # spans the full window width
 
     def _configure_ttk(self):
@@ -790,6 +819,19 @@ class EngineDashboard(tk.Tk):
         s.map("TNotebook.Tab",
               background=[("selected", SURF), ("active", SURF)],
               foreground=[("selected", ACCENT), ("active", TEXT)])
+
+    # ── ESC / Console page ───────────────────────────────────────────────────
+    # A full-width home for the two panels that are cramped in the Engine
+    # page's right-hand column: DroneCAN parameter access and the raw terminal.
+    # Both are second copies, not moves — the Engine page keeps its own, and
+    # the two stay in lockstep (shared entry variables, mirrored scrollback).
+    def _build_console_page(self, parent):
+        wrap = tk.Frame(parent, bg=BG, padx=6, pady=6)
+        wrap.pack(fill="both", expand=True)
+
+        self._build_esc_params(wrap)
+        self._build_internal_panel(wrap)
+        self._build_log(wrap, height=14)   # the tab's whole point: a big log
 
     # ── Pixhawk / MAVLink page ───────────────────────────────────────────────
     # Cube Orange on TELEM1 → J21 / U2 (ESP32 Serial2, GPIO16/17) at 115200 8N1.
@@ -1409,7 +1451,12 @@ class EngineDashboard(tk.Tk):
         c = card(parent, "State Machine / Limits / PID Parameters")
         c.master.pack(fill="both", expand=True, pady=(6, 0))
 
-        canvas = tk.Canvas(c, bg=SURF, highlightthickness=0, width=340)
+        # Explicit (small) height: this canvas scrolls, so its natural size is
+        # irrelevant, but as a MINIMUM it decides how much room is left for the
+        # cards below when the column is short. expand=True still lets it grow
+        # into any spare space on a tall screen.
+        canvas = tk.Canvas(c, bg=SURF, highlightthickness=0, width=340,
+                           height=140)
         vsb = ttk.Scrollbar(c, orient="vertical", command=canvas.yview)
         canvas.configure(yscrollcommand=vsb.set)
         vsb.pack(side="right", fill="y")
@@ -1467,14 +1514,18 @@ class EngineDashboard(tk.Tk):
         row.pack(fill="x")
         tk.Label(row, text="Name", bg=SURF, fg=TEXT_DIM,
                  font=FONT_UI_SML).pack(side="left")
-        self._escp_name = tk.StringVar(value="BUS_CUR_LIM")
+        # This panel is built once on the Engine page and once on the ESC /
+        # Console page. Both copies share the same StringVars, so whatever you
+        # type on one page is already there on the other.
+        if not hasattr(self, "_escp_name"):
+            self._escp_name = tk.StringVar(value="BUS_CUR_LIM")
+            self._escp_val = tk.StringVar()
         tk.Entry(row, textvariable=self._escp_name, width=18, bg="#0d0d14",
                  fg=TEXT, font=FONT_MONO, relief="flat", insertbackground=TEXT,
                  highlightthickness=1, highlightbackground=BORDER,
                  highlightcolor=ACCENT).pack(side="left", padx=4, ipady=1)
         tk.Label(row, text="Value", bg=SURF, fg=TEXT_DIM,
                  font=FONT_UI_SML).pack(side="left")
-        self._escp_val = tk.StringVar()
         tk.Entry(row, textvariable=self._escp_val, width=10, bg="#0d0d14",
                  fg=TEXT, font=FONT_MONO, relief="flat", insertbackground=TEXT,
                  highlightthickness=1, highlightbackground=BORDER,
@@ -1483,13 +1534,45 @@ class EngineDashboard(tk.Tk):
         def escp_get():
             n = self._escp_name.get().strip()
             if n:
+                self._escp_only(n)      # show only this parameter's reply
                 self._send(f"can param get {n}")
 
         def escp_set():
             n = self._escp_name.get().strip()
             v = self._escp_val.get().strip()
             if n and v:
+                self._escp_only(n)
                 self._send(f"can param set {n} {v}")
+
+        def escp_list():
+            self._escp_all()            # List all wants every reply
+            self._escp_seen = 0
+            self._send("can param list")
+            self.after(5000, self._escp_list_check)
+
+        def escp_help():
+            # The ESC's parameter NAMES live in the microDRIVE's own firmware,
+            # not in this repo, so there is no table here to print. Explain the
+            # mechanism and point at List all, which enumerates the real set.
+            self._log("ESC parameters — DroneCAN settings stored inside the "
+                      "Hargrave microDRIVE LPi (about 99 of them):", "event")
+            for line in (
+                "  Names are CASE-SENSITIVE, e.g. BUS_CUR_LIM, not "
+                "bus_cur_lim",
+                "  Get / Set  → 'can param get|set <NAME> [value]'",
+                "  List all   → 'can param list', the only way to see the "
+                "real names your ESC has",
+                "  Save NVM   → 'can save', persists them; the microDRIVE "
+                "reboots itself afterwards",
+                "  Restart ESC→ 'can restart', reboots it and clears latched "
+                "ERROR flags",
+                "  Changes are lost on ESC power-cycle unless you Save NVM",
+                "  Nothing here works while CANRX=0 — the ESC must be "
+                "answering on the bus first",
+                "  These are NOT the ECU's own values: THR, GOV, TC1.. live "
+                "in the panel below",
+            ):
+                self._log(line)
 
         # Get/Set/List on one row, Save/Restart on the next — five across a
         # narrow panel clips the rightmost buttons.
@@ -1499,7 +1582,7 @@ class EngineDashboard(tk.Tk):
             side="left", fill="x", expand=True, padx=2)
         self._sbtn(row2, "Set", escp_set, fg=GREEN).pack(
             side="left", fill="x", expand=True, padx=2)
-        self._sbtn(row2, "List all", lambda: self._send("can param list"),
+        self._sbtn(row2, "List all", escp_list,
                    fg=CYAN).pack(side="left", fill="x", expand=True, padx=2)
         row3 = tk.Frame(c, bg=SURF)
         row3.pack(fill="x", pady=(3, 0))
@@ -1507,29 +1590,562 @@ class EngineDashboard(tk.Tk):
                    fg=YELLOW).pack(side="left", fill="x", expand=True, padx=2)
         self._sbtn(row3, "Restart ESC", lambda: self._send("can restart"),
                    fg=ORANGE).pack(side="left", fill="x", expand=True, padx=2)
+        self._sbtn(row3, "?", escp_help, fg=YELLOW, padx=10).pack(
+            side="left", padx=2)
+
+    # ── ECU internal values ──────────────────────────────────────────────────
+    # "can param get" only ever reaches the DroneCAN ESC. The values the ECU
+    # itself owns — THR, GOV, TC1..TC4, CANRX, the engine parameter table —
+    # never travel over CAN, which is why asking the ESC for THR gets nothing
+    # back. They arrive 10x a second in the DATA frame, so this panel reads
+    # them straight out of the last frame instead of going near the bus.
+    DATA_UNITS = {
+        "THR": "%", "GSP": "rpm", "GOV": "", "FF": "ml/min",
+        "P1": "%", "P2": "%", "SOL1": "%", "SOL2": "%",
+        "TC1": "°C", "TC2": "°C", "TC3": "°C", "TC4": "°C",
+        "ESC_RPM": "rpm", "ESC_V": "V", "ESC_I": "A", "ESC_T": "°C",
+        "ESC_PWR": "%", "ESC_IN": "%", "ESC_OUT": "%", "ESC_MT": "°C",
+        "ESC_AGE": "ms",
+        "I_A": "A", "I_B": "A", "I_AV": "V", "I_BV": "V",
+        "AVP": "V", "AVN": "V", "PZF": "Hz", "PX_HB": "ms",
+    }
+
+    # Live DATA keys that can be written back, and the command that does it.
+    # {v} is the value typed in the Value box. Anything not listed here is a
+    # sensor reading or a counter and is reported as read-only.
+    DATA_WRITES = {
+        "THR":  ("thr {v}",      "throttle %",      True),
+        "GSP":  ("gov sp {v}",   "governor RPM setpoint", True),
+        "P1":   ("pump 1 {v}",   "pump 1 %",        True),
+        "P2":   ("pump 2 {v}",   "pump 2 %",        True),
+        "GOV":  ("gov on|gov off", "governor",      False),
+        "GLW":  ("glow on|glow off", "glow plug",   False),
+        "SOL1": ("sol 1 on|sol 1 off", "solenoid 1", False),
+        "SOL2": ("sol 2 on|sol 2 off", "solenoid 2", False),
+    }
+
+    # What each DATA key means. Sourced from the repo readme (pin table,
+    # MOSFET map, CAN section, stream key list) and from _parse_data below.
+    # Entries marked (?) are still inferred - the readme names the signal but
+    # not the exact semantics; confirm against main.ino.cpp before relying on
+    # them for anything safety-related.
+    DATA_HELP = {
+        # -- engine state machine (readme: "Engine stream keys") --
+        "ENG":  "engine state: OFF / PRECHECK / GLOW / SPOOL / IGNITION / "
+                "WARMUP / RUNNING / COOLDOWN / FAULT / MANUAL. Transitions "
+                "also print as ENG:STATE= events",
+        "FLT":  "latched fault code, NONE when clear. Set by the failsafes "
+                "(over-temp, overspeed, flameout, ESC loss, TC loss). Clears "
+                "with 'eng reset' / RESET FAULT",
+        "ARM":  "ESC armed. 1 = the ESC will act on throttle. Set by "
+                "Arm/Disarm, not writable here",
+        "FCUT": "fuel-cut latch ('fuel cut on|off'). 1 = both pumps forced "
+                "to 0 regardless of demand",
+        "RMP":  "throttle ramp machine: OFF / UP / DOWN / PAUSE, stepped at "
+                "the ramp rate in %/s",
+        # -- commanded outputs --
+        "THR":  "commanded engine throttle, 0-100 % ('thr <0-100>')",
+        "GOV":  "RPM governor on. 1 = the PID owns the throttle (output "
+                "clamped 15-100 %) and GSP is the target",
+        "GSP":  "governor RPM setpoint ('gov sp <rpm>') - only meaningful "
+                "while GOV=1",
+        "P1":   "fuel pump 1 duty, 0-100 % - KNF 1.4-M on M5 / GPIO27",
+        "P2":   "fuel pump 2 duty, 0-100 % - KNF 1.4-M on M4 / GPIO26",
+        "FF":   "fuel flow, ml/min, derived from pump duty and the "
+                "pump1_cal / pump2_cal parameters",
+        "GLW":  "glow plug output. 1 = energised - M1 / GPIO32",
+        "SOL1": "solenoid 1 - M3 / GPIO25",
+        "SOL2": "solenoid 2 - M2 / GPIO33",
+        # -- MOSFET duties (readme: MOSFET outputs table, duty 0-10) --
+        "M1":   "MOSFET 1 raw duty 0-10 - glow plug, J7 / GPIO32",
+        "M2":   "MOSFET 2 raw duty 0-10 - solenoid 2, J8 / GPIO33",
+        "M3":   "MOSFET 3 raw duty 0-10 - solenoid 1, J9 / GPIO25",
+        "M4":   "MOSFET 4 raw duty 0-10 - fuel pump 2, J10 / GPIO26",
+        "M5":   "MOSFET 5 raw duty 0-10 - fuel pump 1, J11 / GPIO27",
+        # -- thermocouples (MAX31855 via PCF8575 chip selects) --
+        "TC1":  "turbine inlet temperature (TIT), °C - J3 / CS1. Reads "
+                "nc / open / sgnd when the probe is missing, open-circuit "
+                "or shorted to ground",
+        "TC2":  "second probe, °C - J4 / CS2. The readme pin table calls it "
+                "EGT, the engine section calls it glow area; same probe",
+        "TC3":  "bearing temperature, °C - J5 / CS3",
+        "TC4":  "coil temperature, °C - J6 / CS4",
+        # -- ESC telemetry, DroneCAN (Hargrave microDRIVE LPi) --
+        "ESC_RPM":   "shaft speed from esc.Status (1034, 10 Hz), RPM",
+        "ESC_V":     "DC bus voltage at the ESC, V - also drives battery %",
+        "ESC_I":     "DC bus current reported by the ESC, A",
+        "ESC_T":     "ESC bridge temperature, °C",
+        "ESC_PWR":   "ESC power, %, from esc.Status",
+        "ESC_ERR":   "Hargrave 13-bit error field: over-temp, over/under-volt, "
+                     "signal loss, saturation etc. 'can esc' spells the bits out",
+        "ESC_AGE":   "age of the newest ESC telemetry - large or rising means "
+                     "the stream has stopped",
+        "ESC_IN":    "ESC input, %, from esc.StatusExtended (1036, 1 Hz)",
+        "ESC_OUT":   "ESC output, %, from StatusExtended",
+        "ESC_MT":    "motor temperature, °C, from StatusExtended",
+        "ESC_CMODE": "what the ECU is commanding: DUTY (RawCommand 1030), "
+                     "RPM (RPMCommand 1031), BRAKE, or OFF",
+        "ESC_CVAL":  "the value being sent in that mode, repeated at 50 Hz",
+        "CANRX":     "DroneCAN frames received from the ESC. 0 means nothing "
+                     "is arriving - check bus wiring, 120 ohm termination, "
+                     "bitrate (default 1 Mbps) and ESC power",
+        # -- DroneCAN node allocation (ECU is the allocation server, node 100) --
+        "NS_ID":   "node ID seen in a NodeStatus heartbeat",
+        "NS_MODE": "that node's mode from NodeStatus",
+        "NS_HP":   "that node's health from NodeStatus",
+        "NS_UP":   "that node's uptime from NodeStatus",
+        "ANON":    "count of anonymous node-ID allocation requests - an ESC "
+                   "with no ID yet asking to be given one",
+        # -- current sensors (QNDB6 hall, GPIO34/35, default 20 A/V) --
+        "I_A":  "current sensor A - Battery, GPIO34, amps",
+        "I_B":  "current sensor B - Load, GPIO35, amps",
+        "I_AV": "(?) sensor A raw volts. NOTE: the readme documents two "
+                "independent QNDB6 hall sensors, while this GUI's cal panel "
+                "treats GPIO34/35 as one differential shunt (I_AV = "
+                "differential, I_BV = common-mode ~1.44 V). Worth confirming "
+                "which board is actually fitted",
+        "I_BV": "(?) sensor B raw volts - see the note on I_AV",
+        "AVP":  "spare analog input VP / GPIO36, volts ('analog vp')",
+        "AVN":  "spare analog input VN / GPIO39, volts ('analog vn')",
+        # -- other on-board hardware --
+        "POT":  "X9C digital pot wiper position, 0-99. Reset to 0 at boot; "
+                "stepped with 'pot up|down|set'",
+        "PZF":  "piezo / atomizer square-wave frequency, Hz - GPIO15 / J19",
+        "PZD":  "piezo / atomizer duty, 0-255",
+        "EXP":  "(?) PCF8575 I/O expander state - the expander at 0x20 also "
+                "carries every thermocouple chip select, so a bad value here "
+                "means the TCs cannot be read",
+        "IFAIL": "(?) peripheral failure counter, almost certainly the I2C / "
+                 "expander bus. Rising = the expander is erroring, which "
+                 "takes the thermocouples with it",
+        "IREC":  "(?) peripheral recovery counter, paired with IFAIL",
+        # -- Pixhawk / MAVLink bridge (Cube Orange, TELEM1 -> Serial2) --
+        "PX_OK":   "MAVLink heartbeat present. 1 = link up",
+        "PX_SYS":  "Pixhawk system ID from the heartbeat",
+        "PX_VER":  "MAVLink version reported by the autopilot",
+        "PX_RAW":  "raw bytes seen on the Serial2 RX pin. 0 = nothing wired "
+                   "or wrong baud (telemetry is usually 57600) - check this "
+                   "before anything else",
+        "PX_RX":   "MAVLink messages successfully decoded",
+        "PX_BAD":  "messages that failed the checksum - non-zero suggests "
+                   "baud mismatch or noise",
+        "PX_TX":   "messages sent to the autopilot",
+        "PX_HB":   "milliseconds since the last heartbeat",
+        "PX_FIX":  "GPS fix: 0 none, 1 no fix, 2 = 2D, 3 = 3D, 4 DGPS, "
+                   "5 RTK float, 6 RTK fixed, 8 static",
+        "PX_SATS": "satellites used in the fix",
+        "PX_HDOP": "horizontal dilution of precision - under 2.0 is healthy",
+    }
+
+    def _int_desc(self, key):
+        d = self.DATA_HELP.get(key)
+        if d:
+            return d
+        return next((f"{lbl} ({unit})" if unit else lbl
+                     for n, lbl, unit in PARAM_META if n == key), "")
+
+    def _int_help(self):
+        """Describe the name in the box, or the whole frame if it isn't one."""
+        name = self._int_name.get().strip()
+        hit = self._int_lookup(name) if name else None
+        if hit:
+            key = hit[0]
+            desc = self._int_desc(key) or "no description on file"
+            unit = self._int_unit(key).strip()
+            rw = self._int_writable(key)
+            self._log(f"{key}{'  [' + unit + ']' if unit else ''}  —  {desc}",
+                      "event")
+            self._log(f"    {rw}")
+            return
+        keys = sorted(self._last_parts or {}) or sorted(self.DATA_HELP)
+        self._log(f"ECU internal parameters — {len(keys)} keys "
+                  f"(type a name and press ? for one of them):", "event")
+        wk = max(len(k) for k in keys)
+        for k in keys:
+            unit = self._int_unit(k).strip()
+            head = f"  {k:<{wk}}  {unit:<6}"
+            self._log(head + (self._int_desc(k) or "—"))
+        self._log("    (?) = inferred, not confirmed against the firmware "
+                  "source — check main.ino.cpp before relying on it")
+
+    def _int_writable(self, key):
+        """One line on whether this key can be written, and how."""
+        if key in self._param_entries:
+            return ("writable — engine parameter, sent as 'eng set'; "
+                    "use Save to ECU to keep it across a reboot")
+        if key in self.DATA_WRITES:
+            cmd, what, numeric = self.DATA_WRITES[key]
+            how = "a number" if numeric else "on / off (or 1 / 0)"
+            return f"writable — {what}; Value takes {how}"
+        return "read-only — a measured value or a counter"
+
+    def _build_internal_panel(self, parent, compact=False):
+        # compact = the Engine page's narrow right column; the ESC / Console
+        # page has the full width for the longer title and hints.
+        c = card(parent, "ECU Internal Values  (DATA + params)" if compact else
+                 "ECU Internal Values  (live DATA stream + engine parameters)")
+        c.master.pack(fill="x", pady=(6, 0))
+
+        row = tk.Frame(c, bg=SURF)
+        row.pack(fill="x")
+        tk.Label(row, text="Name", bg=SURF, fg=TEXT_DIM,
+                 font=FONT_UI_SML).pack(side="left")
+        # Built once on the Engine page and once on the ESC / Console page.
+        # The variables are shared, so the name and interval you set on one
+        # page are already set on the other.
+        if not hasattr(self, "_int_name"):
+            self._int_name = tk.StringVar(value="THR")
+            self._int_value = tk.StringVar()
+            self._int_period = tk.StringVar(value="1")
+            self._int_cbs = []
+            self._int_watch_btns = []
+        # Editable combobox: the dropdown is filled from the keys actually
+        # present in the last DATA frame, so the exact spelling and case are
+        # never a guess.
+        cb = ttk.Combobox(row, textvariable=self._int_name,
+                          width=12 if compact else 16, font=FONT_MONO)
+        cb.config(postcommand=lambda w=cb: self._int_fill_names(w))
+        cb.pack(side="left", padx=4)
+        cb.bind("<Return>", lambda e: self._int_read())
+        self._int_cbs.append(cb)
+        tk.Label(row, text="Value", bg=SURF, fg=TEXT_DIM,
+                 font=FONT_UI_SML).pack(side="left", padx=(8, 0))
+        ve = tk.Entry(row, textvariable=self._int_value,
+                      width=7 if compact else 10, bg="#0d0d14", fg=TEXT,
+                      font=FONT_MONO, relief="flat", insertbackground=TEXT,
+                      highlightthickness=1, highlightbackground=BORDER,
+                      highlightcolor=ACCENT)
+        ve.pack(side="left", padx=4, ipady=1)
+        ve.bind("<Return>", lambda e: self._int_write())
+        tk.Label(row, text="every", bg=SURF, fg=TEXT_DIM,
+                 font=FONT_UI_SML).pack(side="left", padx=(6 if compact else 10, 2))
+        tk.Spinbox(row, from_=1, to=30, increment=1, width=3,
+                   textvariable=self._int_period, justify="center",
+                   bg=SURF2, fg=TEXT, buttonbackground=SURF2, relief="flat",
+                   font=FONT_MONO, highlightthickness=1,
+                   highlightbackground=BORDER).pack(side="left")
+        tk.Label(row, text="s" if compact else "s  (Watch)", bg=SURF,
+                 fg=TEXT_DIM, font=FONT_UI_SML).pack(side="left", padx=(2, 0))
+
+        row2 = tk.Frame(c, bg=SURF)
+        row2.pack(fill="x", pady=(3, 0))
+        self._sbtn(row2, "Read", self._int_read, fg=ACCENT).pack(
+            side="left", fill="x", expand=True, padx=2)
+        self._sbtn(row2, "Write", self._int_write, fg=GREEN).pack(
+            side="left", fill="x", expand=True, padx=2)
+        self._sbtn(row2, "Dump all", self._int_dump, fg=CYAN).pack(
+            side="left", fill="x", expand=True, padx=2)
+        wb = self._sbtn(row2, "Watch", self._int_toggle_watch, fg=TEXT)
+        wb.pack(side="left", fill="x", expand=True, padx=2)
+        self._int_watch_btns.append(wb)
+        self._sbtn(row2, "?", self._int_help, fg=YELLOW, padx=10).pack(
+            side="left", padx=2)
+
+    def _int_fill_names(self, cb):
+        """Offer every key in the newest DATA frame, then the engine params."""
+        names = sorted(self._last_parts or {})
+        names += [p[0] for p in PARAM_META if p[0] not in names]
+        cb["values"] = names
+
+    def _int_watch_label(self, text, fg):
+        for b in self._int_watch_btns:      # both pages show the same state
+            b.config(text=text, fg=fg)
+
+    def _int_unit(self, key):
+        u = self.DATA_UNITS.get(key)
+        if u is None:
+            u = next((m[2] for m in PARAM_META if m[0] == key), "")
+        return f" {u}" if u else ""
+
+    def _int_lookup(self, name):
+        """(key, value, source) for a DATA key or an engine parameter."""
+        for src, table in (("DATA", self._last_parts or {}),
+                           ("param", self._param_entries)):
+            if name in table:
+                v = table[name]
+                return name, (v.get() if src == "param" else v), src
+            # tolerate the wrong case rather than reporting "no such value"
+            hit = {k.lower(): k for k in table}.get(name.lower())
+            if hit:
+                v = table[hit]
+                return hit, (v.get() if src == "param" else v), src
+        return None
+
+    def _int_read(self):
+        name = self._int_name.get().strip()
+        if not name:
+            return False
+        hit = self._int_lookup(name)
+        if not hit:
+            if not self._last_parts:
+                self._log("no telemetry yet — connect, then 'stream on'",
+                          "fault")
+            else:
+                near = [k for k in sorted(self._last_parts)
+                        if name.lower() in k.lower()][:6]
+                msg = f"no internal value named '{name}'"
+                if near:
+                    msg += " — did you mean: " + ", ".join(near)
+                self._log(msg, "fault")
+            return False
+        key, val, src = hit
+        if src == "param":
+            if not str(val).strip():
+                self._log(f"{key} is blank — press 'Read from ECU' on the "
+                          f"Engine page to load the parameter table", "fault")
+                return False
+            self._log(f"ECU  {key} = {val}{self._int_unit(key)}"
+                      f"   (engine parameter)", "event")
+        else:
+            self._log(f"ECU  {key} = {val}{self._int_unit(key)}", "event")
+        if not self._int_watch_job:      # don't fight the Value box while watching
+            self._int_value.set(str(val))
+            desc = self._int_desc(key)
+            if desc:                     # one-line reminder of what it is
+                self._log(f"     {desc}")
+        return True
+
+    # ── writing ──────────────────────────────────────────────────────────────
+    # Engine parameters go out as "eng set <name> <value>" — the same command
+    # the Engine page's parameter table uses. A handful of live DATA keys are
+    # actuator commands instead (throttle, pumps, governor); everything else is
+    # a sensor reading or a counter and cannot be written at all.
+    def _int_write(self):
+        name = self._int_name.get().strip()
+        raw = self._int_value.get().strip()
+        if not name:
+            return
+        if not raw:
+            self._log("Value is empty — nothing to write", "fault")
+            return
+
+        # engine parameter?
+        key = name if name in self._param_entries else \
+            {k.lower(): k for k in self._param_entries}.get(name.lower())
+        if key:
+            if not _is_float(raw):
+                self._log(f"{key} expects a number, got '{raw}'", "fault")
+                return
+            self._param_entries[key].set(raw)   # keep the Engine page in step
+            self._send(f"eng set {key} {raw}")
+            self._log(f"wrote  {key} = {raw}{self._int_unit(key)}"
+                      f"   (engine parameter — 'Save to ECU' to keep it "
+                      f"across a reboot)", "event")
+            return
+
+        # live actuator key?
+        parts = self._last_parts or {}
+        dkey = name if name in self.DATA_WRITES else \
+            {k.lower(): k for k in self.DATA_WRITES}.get(name.lower())
+        if dkey:
+            self._int_write_data(dkey, raw)
+            return
+
+        # known but not writable
+        pkey = name if name in parts else \
+            {k.lower(): k for k in parts}.get(name.lower())
+        if pkey:
+            self._log(f"{pkey} is read-only — it is a measured value or a "
+                      f"counter, not a setting", "fault")
+        else:
+            self._log(f"no internal value named '{name}'", "fault")
+
+    def _int_write_data(self, key, raw):
+        cmd, what, numeric = self.DATA_WRITES[key]
+        if numeric:
+            if not _is_float(raw):
+                self._log(f"{key} expects a number, got '{raw}'", "fault")
+                return
+            cmd = cmd.format(v=raw)
+        else:
+            on_cmd, off_cmd = cmd.split("|")
+            truthy = raw.strip().lower() in ("1", "on", "true", "yes")
+            falsy = raw.strip().lower() in ("0", "off", "false", "no")
+            if not (truthy or falsy):
+                self._log(f"{key} expects on/off (or 1/0), got '{raw}'",
+                          "fault")
+                return
+            cmd = on_cmd if truthy else off_cmd
+        # Throttle, setpoint and pumps move hardware. Ask first — this box is
+        # a diagnostic tool, not a place to spin the turbine by accident.
+        if key in ("THR", "GSP", "P1", "P2"):
+            if not messagebox.askyesno(
+                    "Confirm write",
+                    f"Set {what} to {raw}?\n\nThis sends '{cmd}' and acts on "
+                    f"the engine immediately."):
+                self._log(f"write to {key} cancelled", "event")
+                return
+        self._send(cmd)
+        self._log(f"wrote  {key} → {what} = {raw}", "event")
+
+    def _term_chars(self):
+        """Width of the widest visible terminal, in characters."""
+        best = 40
+        for t in self._terms:
+            try:
+                if not t.winfo_ismapped():
+                    continue
+                fw = tkfont.Font(font=t.cget("font")).measure("0") or 7
+                best = max(best, int((t.winfo_width() - 20) / fw) - 11)
+            except (tk.TclError, ZeroDivisionError):
+                pass
+        return max(40, best)      # minus the "[HH:MM:SS] " stamp _log adds
+
+    def _int_dump(self):
+        parts = self._last_parts or {}
+        if not parts:
+            self._log("no telemetry yet — connect, then 'stream on'", "fault")
+            return
+        rows = sorted(parts.items())
+        # Column widths from the actual content, so name, value and unit line
+        # up in the terminal's monospace font instead of drifting.
+        wk = max(len(k) for k, _ in rows)
+        wv = max(len(str(v)) for _, v in rows)
+        units = {k: self._int_unit(k).strip() for k, _ in rows}
+        wu = max((len(u) for u in units.values()), default=0)
+
+        cell = f"{{:<{wk}}}  {{:>{wv}}} {{:<{wu}}}"
+        gap = "   |   "
+        # Fit as many columns as the widest terminal can show without the
+        # word-wrap breaking the alignment.
+        cols = max(1, min(3, self._term_chars() // (wk + wv + wu + 3 + len(gap))))
+        per_col = -(-len(rows) // cols)        # ceil
+
+        self._log(f"ECU internal values — {len(rows)} keys from the last "
+                  f"DATA frame:", "event")
+        for i in range(per_col):
+            line = []
+            for c in range(cols):
+                idx = c * per_col + i          # column-major: reads down
+                if idx < len(rows):
+                    k, v = rows[idx]
+                    line.append(cell.format(k, str(v), units[k]))
+                else:
+                    line.append(" " * (wk + wv + wu + 3))
+            self._log("  " + gap.join(line).rstrip())
+
+    def _int_toggle_watch(self):
+        if self._int_watch_job:
+            self.after_cancel(self._int_watch_job)
+            self._int_watch_job = None
+            self._int_watch_label("Watch", TEXT)
+            self._log("watch stopped", "event")
+            return
+        self._int_watch_label("Watch: ON", GREEN)
+        self._int_watch_tick()
+
+    def _int_watch_tick(self):
+        if not self._int_read():          # bad name — stop instead of spamming
+            self._int_watch_job = None
+            self._int_watch_label("Watch", TEXT)
+            return
+        try:
+            period = max(1, min(30, int(float(self._int_period.get()))))
+        except ValueError:
+            period = 1
+        self._int_watch_job = self.after(period * 1000, self._int_watch_tick)
 
     # ── Event log / terminal ─────────────────────────────────────────────────
-    def _build_log(self, parent):
-        c = card(parent, "Events / Terminal")
-        c.master.pack(fill="both", expand=True, pady=(6, 0))
-        self._term = scrolledtext.ScrolledText(
-            c, bg="#0d0d14", fg=TEXT, font=("Consolas", 9), height=8,
+    def _make_term(self, parent, height, font=("Consolas", 9)):
+        """A terminal widget wired into the mirror list used by _log()."""
+        term = scrolledtext.ScrolledText(
+            parent, bg="#0d0d14", fg=TEXT, font=font, height=height,
             state="disabled", wrap="word", relief="flat", padx=4, pady=4)
-        self._term.pack(fill="both", expand=True)
-        self._term.tag_config("event", foreground=YELLOW)
-        self._term.tag_config("fault", foreground=RED)
-        self._term.tag_config("sent", foreground=CYAN)
-        self._term.tag_config("data", foreground="#3a3f58")
+        term.tag_config("event", foreground=YELLOW)
+        term.tag_config("fault", foreground=RED)
+        term.tag_config("sent", foreground=CYAN)
+        term.tag_config("data", foreground="#3a3f58")
+        # Every terminal built gets the same lines from _log(), so the Engine
+        # page, the ESC / Console page and the pop-out window stay identical.
+        self._terms.append(term)
+        self._term = self._terms[0]
+        return term
 
-        inp = tk.Frame(c, bg=SURF)
-        inp.pack(fill="x", pady=(3, 0))
-        self._cmd_var = tk.StringVar()
-        e = tk.Entry(inp, textvariable=self._cmd_var, bg="#0d0d14", fg=TEXT,
+    def _cmd_entry(self, parent):
+        if not hasattr(self, "_cmd_var"):
+            self._cmd_var = tk.StringVar()
+        e = tk.Entry(parent, textvariable=self._cmd_var, bg="#0d0d14", fg=TEXT,
                      font=FONT_MONO, relief="flat", insertbackground=TEXT,
                      highlightthickness=1, highlightbackground=BORDER,
                      highlightcolor=ACCENT)
-        e.pack(side="left", fill="x", expand=True, ipady=2)
         e.bind("<Return>", self._send_typed)
+        return e
+
+    def _build_log(self, parent, height=8):
+        c = card(parent, "Events / Terminal")
+        c.master.pack(fill="both", expand=True, pady=(6, 0))
+        # Command entry is packed FIRST, against the bottom, so it keeps its
+        # row even when the log above it asks for more height than the page has.
+        inp = tk.Frame(c, bg=SURF)
+        inp.pack(side="bottom", fill="x", pady=(3, 0))
+
+        term = self._make_term(c, height)
+        term.pack(fill="both", expand=True)
+
+        # Buttons first (side=right), so the entry takes the remaining width.
+        self._sbtn(inp, "Clear", self._clear_log, fg=TEXT_DIM,
+                   padx=6, font=FONT_UI_SML).pack(side="right", padx=(4, 0))
+        self._sbtn(inp, "Pop out ⧉", self._popout_log, fg=ACCENT,
+                   padx=6, font=FONT_UI_SML).pack(side="right", padx=(4, 0))
+        self._cmd_entry(inp).pack(side="left", fill="x", expand=True, ipady=2)
+
+    def _clear_log(self):
+        for term in self._terms:
+            try:
+                term.config(state="normal")
+                term.delete("1.0", "end")
+                term.config(state="disabled")
+            except tk.TclError:
+                pass
+
+    # ── Terminal in its own window ───────────────────────────────────────────
+    # The in-page log has to share height with the panels above it. Popping it
+    # out gives it a resizable window of its own — drag it to a second monitor
+    # during a run. It mirrors the same scrollback and takes the same typed
+    # commands; closing it changes nothing else.
+    def _popout_log(self):
+        if self._log_win is not None and self._log_win.winfo_exists():
+            self._log_win.deiconify()
+            self._log_win.lift()
+            self._log_win.focus_force()
+            return
+
+        win = tk.Toplevel(self)
+        self._log_win = win
+        win.title("UMGT — Events / Terminal")
+        win.configure(bg=BG)
+        win.geometry("980x620")
+        win.minsize(420, 220)
+
+        c = card(win, "Events / Terminal")
+        c.master.pack(fill="both", expand=True, padx=6, pady=6)
+        inp = tk.Frame(c, bg=SURF)
+        inp.pack(side="bottom", fill="x", pady=(3, 0))
+
+        term = self._make_term(c, 24, font=("Consolas", 10))
+        term.pack(fill="both", expand=True)
+        # start from what is already on screen rather than an empty window
+        try:
+            history = self._terms[0].get("1.0", "end-1c")
+            if history.strip():
+                term.config(state="normal")
+                term.insert("end", history + "\n")
+                term.see("end")
+                term.config(state="disabled")
+        except tk.TclError:
+            pass
+
+        self._sbtn(inp, "Clear", self._clear_log, fg=TEXT_DIM,
+                   padx=6, font=FONT_UI_SML).pack(side="right", padx=(4, 0))
+        self._cmd_entry(inp).pack(side="left", fill="x", expand=True, ipady=2)
+
+        win.protocol("WM_DELETE_WINDOW", lambda: self._close_log_win(win, term))
+
+    def _close_log_win(self, win, term):
+        if term in self._terms:
+            self._terms.remove(term)
+        self._log_win = None
+        win.destroy()
 
     # ── Connection ────────────────────────────────────────────────────────────
     def _refresh_ports(self):
@@ -1568,6 +2184,9 @@ class EngineDashboard(tk.Tk):
             self._send("stream on")
 
     def _send(self, cmd):
+        self._echo_recent = {k: v for k, v in self._echo_recent.items()
+                             if v > time.time()}
+        self._echo_recent[cmd] = time.time() + 2.0
         if self._worker and self._worker.is_alive():
             self._tx_q.put((cmd + "\n").encode())
             self._log(f"› {cmd}", "sent")
@@ -1737,7 +2356,26 @@ class EngineDashboard(tk.Tk):
         finally:
             self.after(40, self._poll)
 
+    # The ECU CLI writes its prompt ("> ") with NO trailing newline, so the
+    # serial reader — which splits on \n — hands us the prompt glued to
+    # whatever the firmware prints next: "> DATA:TC1=nc,...". That failed the
+    # startswith("DATA:") test below and fell through to the raw dump at the
+    # bottom, which is why every command looked like it answered with a wall
+    # of parameters. Peel the prompt off first.
+    _PROMPT_RE = re.compile(r"^(?:[>\u203a]\s*)+")
+
+    # How long after a Get/Set we treat parameter replies as answering that
+    # specific request.
+    ESCP_WINDOW_S = 4.0
+
     def _on_line(self, line):
+        line = self._PROMPT_RE.sub("", line).strip()
+        if not line:
+            return
+        # The firmware echoes each command back; we already logged it when we
+        # sent it, so drop the echo instead of printing it two or three times.
+        if self._echo_recent.get(line, 0) > time.time():
+            return
         if line == "HB":
             self._last_hb = time.time()
             return
@@ -1769,10 +2407,68 @@ class EngineDashboard(tk.Tk):
             return
         if line.startswith("CAN:RX"):
             return  # too chatty for the engine log
-        if line.startswith("PARAMESC:"):
-            self._log(line, "event")   # highlight ESC param responses
+        rep = self._escp_reply(line)
+        if rep:
+            name, val = rep
+            self._escp_seen += 1
+            if self._escp_want and time.time() < self._escp_until:
+                if name != self._escp_want:
+                    return              # a parameter we did not ask for
+                self._escp_val.set(val)  # mirror the answer into Value
+                self._escp_all()         # request satisfied
+            self._log(f"ESC param  {name} = {val}", "event")
             return
         self._log(line)
+
+    # ── ESC parameter reply filtering ────────────────────────────────────────
+    # "can param get THR" is answered on the same link that carries everything
+    # else. After a Get/Set we remember which name was asked for and drop
+    # replies about any other parameter, so the log shows just that one.
+    def _escp_only(self, name):
+        self._escp_want = name
+        self._escp_until = time.time() + self.ESCP_WINDOW_S
+        # Silence is the most confusing possible answer. If nothing comes back
+        # inside the window, say so — and say what to check.
+        self.after(int(self.ESCP_WINDOW_S * 1000) + 100,
+                   lambda: self._escp_timeout(name))
+
+    def _escp_timeout(self, name):
+        if self._escp_want != name:
+            return                  # answered, or a newer request replaced it
+        self._escp_all()
+        self._log(f"no reply for {name} — {self._can_hint()}", "fault")
+
+    def _escp_list_check(self):
+        if self._escp_seen == 0:
+            self._log(f"'can param list' returned nothing — {self._can_hint()}",
+                      "fault")
+
+    def _can_hint(self):
+        """Why the ESC probably isn't answering, using the live DATA frame."""
+        rx = (self._last_parts or {}).get("CANRX")
+        if rx is not None and rx.strip() in ("0", "0.0"):
+            return ("the ECU has received 0 CAN frames (CANRX=0), so the ESC "
+                    "is not talking on the bus at all — check CAN H/L wiring, "
+                    "120 Ohm termination at both ends, bitrate and node ID, "
+                    "and that the ESC is powered")
+        return (f"the ESC did not respond (CANRX={rx if rx is not None else '?'})"
+                " — check the parameter name (they are CASE-SENSITIVE) and that"
+                " the ESC is on the bus")
+
+    def _escp_all(self):
+        """Stop filtering — used by List all, and once a request is answered."""
+        self._escp_want = None
+        self._escp_until = 0.0
+
+    def _escp_reply(self, line):
+        """Return (name, value) if the line is an ESC parameter reply."""
+        m = re.match(r"^PARAMESC:\s*([A-Za-z_]\w*)\s*[=:]\s*(\S+)", line)
+        if not m and self._escp_want and time.time() < self._escp_until:
+            # Some firmware builds answer with a bare "THR=2.0". Only accept
+            # that shape while a request is outstanding, so ordinary console
+            # output never gets mistaken for a parameter.
+            m = re.match(r"^([A-Za-z_]\w*)\s*=\s*([-+\w.]+)$", line)
+        return (m.group(1), m.group(2)) if m else None
 
     def _parse_data(self, payload):
         parts = {}
@@ -1780,6 +2476,7 @@ class EngineDashboard(tk.Tk):
             if "=" in p:
                 k, v = p.split("=", 1)
                 parts[k.strip()] = v.strip()
+        self._last_parts = parts      # kept for the ESC-param timeout report
 
         def fget(key):
             try:
@@ -2026,13 +2723,18 @@ class EngineDashboard(tk.Tk):
                 self._status_lbl.config(text="●  No heartbeat!", fg=YELLOW)
 
     def _log(self, text, tag=""):
-        self._term.config(state="normal")
         ts = time.strftime("%H:%M:%S")
-        self._term.insert("end", f"[{ts}] {text}\n", tag if tag else ())
-        if float(self._term.index("end-1c").split(".")[0]) > 2000:
-            self._term.delete("1.0", "400.0")
-        self._term.see("end")
-        self._term.config(state="disabled")
+        line = f"[{ts}] {text}\n"
+        for term in self._terms:
+            try:
+                term.config(state="normal")
+                term.insert("end", line, tag if tag else ())
+                if float(term.index("end-1c").split(".")[0]) > 2000:
+                    term.delete("1.0", "400.0")
+                term.see("end")
+                term.config(state="disabled")
+            except tk.TclError:
+                pass          # widget torn down during shutdown
 
     def _on_close(self):
         if self._recording and self._csv_file:
