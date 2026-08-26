@@ -16,6 +16,7 @@ Build: pyinstaller --onefile --windowed --name UMGT_Engine engine_dashboard.py
 """
 
 import json
+import math
 import os
 import re
 import time
@@ -53,6 +54,10 @@ FONT_UI_SML  = ("Segoe UI", 9)
 FONT_TITLE   = ("Segoe UI", 11, "bold")
 
 BAUD         = 115200
+# throttle thumb-wheel: one full 360 deg turn = this many percent of
+# full scale.  Default 5 %, the user can pick anything from 5 % to 15 %
+# in the "%/turn" spinbox under the wheel.
+SPEED_PCT_PER_REV = 5.0
 HB_TIMEOUT_S = 3.5
 
 PARAMS_FILE  = os.path.join(os.path.expanduser("~"), ".umgt_engine_params.json")
@@ -238,6 +243,371 @@ class StripChart(tk.Canvas):
             self.create_line(*coords, fill=self.color, width=2)
         self.create_text(8, h - 12, text=f"{pts[-1][1]:.6g}", fill=self.color,
                          font=FONT_MONO_MD, anchor="w")
+
+
+# ── Thumb-wheel (vertical scroll wheel, replaces the throttle % scrollbar) ────
+class ThumbWheel(tk.Frame):
+    """Vertical 360-degree scroll wheel used for throttle / RPM setpoint.
+
+    One full turn (360 deg) of the wheel changes the value by `pct_per_rev`
+    percent of the full scale.  Default 5 %, adjustable 5 % .. 15 % from the
+    "%/turn" spinbox under the wheel (or from code via config(pct_per_rev=..)).
+
+    Ways to move it:
+        drag              - PX_PER_REV pixels of travel = one full turn
+        mouse wheel       - one detent = 1/DETENTS turn
+                            Shift = 1/10 detent (fine), Ctrl = one full turn
+        Up / Down         - one detent      PgUp / PgDn - one full turn
+        type + Enter      - jump straight to an exact value
+
+    Drop-in replacement for the tk.Scale it supersedes: get(), set(value) and
+    config(from_=, to=, resolution=) keep the same meaning.
+    """
+
+    RIDGES     = 44       # ridges machined around the drum
+    DETENTS    = 24       # mouse-wheel clicks per full turn
+    PX_PER_REV = 260.0    # drag distance (px) for one full turn
+    PCT_MIN    = 5.0      # limits on "% of full scale per turn"
+    PCT_MAX    = 15.0
+
+    DRUM_DARK  = "#07070c"
+    DRUM_LIT   = "#a3aed4"
+    COMMIT_MS  = 350      # idle time after a wheel/key step before "release"
+
+    def __init__(self, parent, from_=0.0, to=100.0, resolution=1.0,
+                 pct_per_rev=5.0, unit="%", width=62, height=250,
+                 command=None, press_cmd=None, release_cmd=None, **kw):
+        # plain attributes first: configure() may run before the widget exists
+        self._vmin, self._vmax = float(min(from_, to)), float(max(from_, to))
+        self._res = float(resolution) or 1.0
+        self._pct = self._clamp_pct(pct_per_rev)
+        self._unit = unit
+        self._val = self._vmin
+        self._cmd = command
+        self._press_cmd = press_cmd
+        self._rel_cmd = release_cmd
+        self._drag_y = None
+        self._transient = False      # a wheel/key gesture is in progress
+        self._commit_job = None
+        self._editing = False
+        super().__init__(parent, bg=SURF, **kw)
+        # pin the column width so the wheel never elbows the ESC panel
+        super().configure(width=width, height=height + 60)
+        self.pack_propagate(False)
+
+        self.cv = tk.Canvas(self, width=width, height=height, bg=SURF,
+                            highlightthickness=0,
+                            cursor="sb_v_double_arrow", takefocus=1)
+        self.cv.pack(fill="both", expand=True)
+
+        # readout — also an input field: type a value, press Enter
+        self.txt = tk.StringVar()
+        self.entry = tk.Entry(self, textvariable=self.txt, width=6,
+                              justify="center", bg=SURF2, fg=CYAN,
+                              insertbackground=CYAN, relief="flat",
+                              font=FONT_MONO_MD, highlightthickness=1,
+                              highlightbackground=BORDER, highlightcolor=ACCENT)
+        self.entry.pack(fill="x", pady=(4, 0))
+
+        row = tk.Frame(self, bg=SURF)
+        row.pack(fill="x", pady=(3, 0))
+        tk.Label(row, text="%/t", bg=SURF, fg=TEXT_DIM,
+                 font=("Segoe UI", 8)).pack(side="left")
+        self.pct_var = tk.StringVar(value=f"{self._pct:g}")
+        self.spin = tk.Spinbox(row, from_=self.PCT_MIN, to=self.PCT_MAX,
+                               increment=1, width=3, textvariable=self.pct_var,
+                               command=self._on_pct, justify="center",
+                               bg=SURF2, fg=TEXT, buttonbackground=SURF2,
+                               relief="flat", font=("Consolas", 9),
+                               highlightthickness=1, highlightbackground=BORDER)
+        self.spin.pack(side="right")
+        self.spin.bind("<Return>", self._on_pct)
+        self.spin.bind("<FocusOut>", self._on_pct)
+
+        for w in (self.cv, self):
+            w.bind("<MouseWheel>", self._on_wheel)      # Windows / macOS
+            w.bind("<Button-4>", self._on_wheel)        # X11 up
+            w.bind("<Button-5>", self._on_wheel)        # X11 down
+        self.cv.bind("<ButtonPress-1>", self._on_press)
+        self.cv.bind("<B1-Motion>", self._on_drag)
+        self.cv.bind("<ButtonRelease-1>", self._on_release)
+        self.cv.bind("<Up>",    lambda e: self._key_step( 1.0 / self.DETENTS))
+        self.cv.bind("<Down>",  lambda e: self._key_step(-1.0 / self.DETENTS))
+        self.cv.bind("<Prior>", lambda e: self._key_step( 1.0))
+        self.cv.bind("<Next>",  lambda e: self._key_step(-1.0))
+        self.cv.bind("<Configure>", lambda e: self._redraw())
+        self.entry.bind("<Return>", self._on_entry)
+        self.entry.bind("<FocusIn>", lambda e: setattr(self, "_editing", True))
+        self.entry.bind("<FocusOut>", self._on_entry_leave)
+
+        self._refresh_text()
+        self._redraw()
+
+    # ── scale-compatible API ─────────────────────────────────────────────────
+    def get(self):
+        v = round(self._val / self._res) * self._res
+        v = max(self._vmin, min(self._vmax, v))
+        return int(round(v)) if float(self._res).is_integer() else round(v, 3)
+
+    def set(self, value):
+        """Move the wheel without firing the command (telemetry echo)."""
+        try:
+            self._apply(float(value), notify=False)
+        except (TypeError, ValueError):
+            pass
+
+    def configure(self, cnf=None, **kw):
+        kw = dict(cnf or {}, **kw)
+        touched = False
+        if "from_" in kw or "to" in kw:
+            a = float(kw.pop("from_", self._vmin))
+            b = float(kw.pop("to", self._vmax))
+            self._vmin, self._vmax = min(a, b), max(a, b)
+            touched = True
+        if "resolution" in kw:
+            self._res = float(kw.pop("resolution")) or 1.0
+            touched = True
+        if "pct_per_rev" in kw:
+            self._pct = self._clamp_pct(kw.pop("pct_per_rev"))
+            self.pct_var.set(f"{self._pct:g}")
+            touched = True
+        if "unit" in kw:
+            self._unit = kw.pop("unit")
+            touched = True
+        if touched:
+            self._apply(self._val, notify=False)
+        if kw:
+            super().configure(**kw)
+
+    config = configure
+
+    # ── % per turn ───────────────────────────────────────────────────────────
+    def _clamp_pct(self, v):
+        try:
+            v = float(v)
+        except (TypeError, ValueError):
+            v = 5.0
+        return max(self.PCT_MIN, min(self.PCT_MAX, v))
+
+    def _on_pct(self, _=None):
+        pct = self._clamp_pct(self.pct_var.get())
+        self.pct_var.set(f"{pct:g}")
+        if pct != self._pct:
+            self._pct = pct
+            self._redraw()
+
+    def per_rev(self):
+        """Value change produced by one full 360 deg turn."""
+        return max(1e-9, (self._vmax - self._vmin) * self._pct / 100.0)
+
+    # ── motion ───────────────────────────────────────────────────────────────
+    def _angle(self):
+        return (self._val - self._vmin) / self.per_rev() * 360.0
+
+    def _apply(self, v, notify=True):
+        v = max(self._vmin, min(self._vmax, float(v)))
+        changed = abs(v - self._val) > 1e-12
+        self._val = v
+        self._refresh_text()
+        self._redraw()
+        if notify and changed and self._cmd:
+            self._cmd(self.get())
+
+    def _turn(self, turns):
+        self._apply(self._val + turns * self.per_rev())
+
+    def _on_press(self, e):
+        self.cv.focus_set()
+        self._cancel_commit()
+        self._drag_y = e.y
+        if self._press_cmd:
+            self._press_cmd()
+
+    def _on_drag(self, e):
+        if self._drag_y is None:
+            return
+        dy = e.y - self._drag_y
+        self._drag_y = e.y
+        self._turn(-dy / self.PX_PER_REV)     # drag up = more
+
+    def _on_release(self, _e=None):
+        if self._drag_y is None:
+            return
+        self._drag_y = None
+        if self._rel_cmd:
+            self._rel_cmd()
+
+    def _on_wheel(self, e):
+        step = 1.0 / self.DETENTS
+        if e.state & 0x0001:          # Shift - fine
+            step /= 10.0
+        elif e.state & 0x0004:        # Ctrl - a whole turn
+            step = 1.0
+        if getattr(e, "num", 0) == 4:
+            d = 1
+        elif getattr(e, "num", 0) == 5:
+            d = -1
+        else:
+            d = 1 if getattr(e, "delta", 0) > 0 else -1
+        self._begin_transient()
+        self._turn(d * step)
+        self._schedule_commit()
+        return "break"
+
+    def _key_step(self, turns):
+        self._begin_transient()
+        self._turn(turns)
+        self._schedule_commit()
+        return "break"
+
+    # wheel/key gestures have no press+release, so synthesise them
+    def _begin_transient(self):
+        self._cancel_commit()
+        if not self._transient:
+            self._transient = True
+            if self._press_cmd:
+                self._press_cmd()
+
+    def _schedule_commit(self):
+        self._commit_job = self.after(self.COMMIT_MS, self._commit)
+
+    def _cancel_commit(self):
+        if self._commit_job:
+            try:
+                self.after_cancel(self._commit_job)
+            except Exception:
+                pass
+            self._commit_job = None
+
+    def _commit(self):
+        self._commit_job = None
+        self._transient = False
+        if self._rel_cmd:
+            self._rel_cmd()
+
+    # ── typed entry ──────────────────────────────────────────────────────────
+    def _on_entry(self, _=None):
+        try:
+            v = float(self.txt.get().split()[0])
+        except (ValueError, IndexError):
+            self._refresh_text()
+            return "break"
+        self._editing = False
+        if self._press_cmd:
+            self._press_cmd()
+        self._apply(v)
+        if self._rel_cmd:
+            self._rel_cmd()
+        self.cv.focus_set()
+        return "break"
+
+    def _on_entry_leave(self, _=None):
+        self._editing = False
+        self._refresh_text()
+
+    def _refresh_text(self):
+        if self._editing:
+            return
+        v = self.get()
+        self.txt.set(f"{v:d} {self._unit}" if isinstance(v, int)
+                     else f"{v:g} {self._unit}")
+
+    # ── painting ─────────────────────────────────────────────────────────────
+    @staticmethod
+    def _mix(c1, c2, t):
+        t = max(0.0, min(1.0, t))
+        a = (int(c1[1:3], 16), int(c1[3:5], 16), int(c1[5:7], 16))
+        b = (int(c2[1:3], 16), int(c2[3:5], 16), int(c2[5:7], 16))
+        return "#%02x%02x%02x" % tuple(int(a[i] + (b[i] - a[i]) * t)
+                                       for i in range(3))
+
+    def _redraw(self, _=None):
+        cv = self.cv
+        cv.delete("all")
+        w = cv.winfo_width() or int(cv["width"])
+        h = cv.winfo_height() or int(cv["height"])
+        if w < 30 or h < 70:
+            return
+
+        foot = 14                       # room for the angle readout
+        bx0, bx1 = 10, w - 10           # bezel
+        by0, by1 = 6, h - foot - 6
+        x0, x1 = bx0 + 5, bx1 - 5       # drum face
+        y0, y1 = by0 + 6, by1 - 6
+        cy = (y0 + y1) / 2.0
+        R = (y1 - y0) / 2.0
+        if R < 8:
+            return
+
+        # bezel + machined slot
+        cv.create_rectangle(bx0, by0, bx1, by1, fill="#15151f",
+                            outline=BORDER)
+        cv.create_rectangle(bx0 + 2, by0 + 2, bx1 - 2, by1 - 2,
+                            fill="#0d0d15", outline="#000000")
+        cv.create_rectangle(x0, y0, x1, y1, fill=self.DRUM_DARK,
+                            outline="#000000")
+
+        # side scale ticks
+        for i in range(11):
+            ty = y0 + (y1 - y0) * i / 10.0
+            long_ = (i % 5 == 0)
+            ln = 8 if long_ else 5
+            col = TEXT_DIM if long_ else BORDER
+            cv.create_line(bx0 - ln, ty, bx0 - 1, ty, fill=col)
+            cv.create_line(bx1 + 1, ty, bx1 + ln, ty, fill=col)
+
+        # Cylindrical face: a point on the drum at angle t sits at
+        # y = cy - R*sin(t) and faces us while cos(t) > 0, so cos(t) is also
+        # the lighting term - bright across the middle, falling off at the
+        # rims where the ridges crowd together.  That crowding is what makes
+        # the rotation readable.
+        def lit(y):
+            s = (cy - y) / R
+            s = max(-1.0, min(1.0, s))
+            return (1.0 - s * s) ** 0.5          # = cos(t)
+
+        strip = 2
+        yy = y0
+        while yy < y1:
+            b = lit(yy + strip / 2.0) ** 0.75
+            cv.create_rectangle(x0 + 1, yy, x1 - 1, min(yy + strip, y1),
+                                width=0,
+                                fill=self._mix(self.DRUM_DARK, self.DRUM_LIT,
+                                               0.06 + 0.94 * b))
+            yy += strip
+
+        # the ridges themselves - dark slots machined into the drum
+        ang = math.radians(self._angle())
+        step = 2.0 * math.pi / self.RIDGES
+        for i in range(self.RIDGES):
+            t = ang + i * step
+            c = math.cos(t)
+            if c <= 0.03:
+                continue
+            y = cy - R * math.sin(t)
+            gap = max(1.0, 2.0 * c)             # slots foreshorten at the rims
+            cv.create_rectangle(x0 + 5, y, x1 - 5, y + gap, width=0,
+                                fill=self._mix(self.DRUM_DARK, "#000000",
+                                               0.35 + 0.65 * c))
+            cv.create_line(x0 + 5, y + gap + 1, x1 - 5, y + gap + 1,
+                           fill=self._mix(self.DRUM_DARK, "#ffffff",
+                                          0.25 * c))
+
+        # rim shadow so the drum reads as sunk into the bezel
+        for k in range(4):
+            col = self._mix("#000000", self.DRUM_DARK, k / 4.0)
+            cv.create_line(x0 + 1, y0 + k, x1 - 1, y0 + k, fill=col)
+            cv.create_line(x0 + 1, y1 - k, x1 - 1, y1 - k, fill=col)
+
+        # index mark at the centre - the value the drum is "reading"
+        cv.create_line(bx0 - 9, cy, bx0 + 3, cy, fill=ACCENT, width=2)
+        cv.create_line(bx1 - 3, cy, bx1 + 9, cy, fill=ACCENT, width=2)
+
+        # angle inside the current turn
+        deg = self._angle() % 360.0
+        cv.create_text(w / 2, h - foot / 2 - 1,
+                       text=f"{deg:.0f}\u00b0",
+                       fill=TEXT_DIM, font=("Consolas", 8))
 
 
 # ── Card helper ───────────────────────────────────────────────────────────────
@@ -765,22 +1135,24 @@ class EngineDashboard(tk.Tk):
         top = tk.Frame(c, bg=SURF)
         top.pack(fill="both", expand=True)
 
-        # big vertical speed slider (LabVIEW 'speed')
+        # big vertical thumb-wheel (was the LabVIEW 'speed' slider):
+        # 360 deg of wheel = SPEED_PCT_PER_REV % of full scale (5 % default)
         sl_frame = tk.Frame(top, bg=SURF)
         sl_frame.pack(side="left", fill="y", padx=(0, 8))
         tk.Label(sl_frame, text="speed", bg=SURF, fg=TEXT_DIM,
                  font=FONT_UI_SML).pack()
-        self._speed_slider = tk.Scale(
-            sl_frame, from_=100, to=0, orient="vertical", length=330,
-            bg=SURF, fg=TEXT, troughcolor=SURF2, highlightthickness=0,
-            sliderlength=22, width=26, font=FONT_MONO,
-            command=self._on_speed_move)
+        self._speed_slider = ThumbWheel(
+            sl_frame, from_=0, to=100, resolution=1,
+            pct_per_rev=SPEED_PCT_PER_REV, unit="%", width=62, height=250,
+            command=self._on_speed_move,
+            press_cmd=self._on_speed_press,
+            release_cmd=self._on_speed_release)
         self._speed_slider.pack(fill="y", expand=True)
-        self._speed_slider.bind("<ButtonPress-1>", self._on_speed_press)
-        self._speed_slider.bind("<ButtonRelease-1>", self._on_speed_release)
         self._speed_mode_lbl = tk.Label(sl_frame, text="throttle %", bg=SURF,
                                         fg=CYAN, font=FONT_UI_SML)
         self._speed_mode_lbl.pack()
+        tk.Label(sl_frame, text="drag/wheel", bg=SURF,
+                 fg=TEXT_DIM, font=("Segoe UI", 8)).pack()
 
         ctl = tk.Frame(top, bg=SURF)
         ctl.pack(side="left", fill="both", expand=True)
@@ -1613,10 +1985,12 @@ class EngineDashboard(tk.Tk):
                     mx = float(self._param_entries["max_rpm"].get() or 120000)
                 except ValueError:
                     mx = 120000
-                self._speed_slider.config(from_=mx, to=0, resolution=100)
+                self._speed_slider.config(from_=mx, to=0, resolution=100,
+                                          unit="rpm")
                 self._speed_mode_lbl.config(text="RPM setpoint", fg=GREEN)
             else:
-                self._speed_slider.config(from_=100, to=0, resolution=1)
+                self._speed_slider.config(from_=100, to=0, resolution=1,
+                                          unit="%")
                 self._speed_mode_lbl.config(text="throttle %", fg=CYAN)
         finally:
             self._slider_inhibit = False
