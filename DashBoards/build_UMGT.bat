@@ -1,3 +1,3 @@
 ::pip install pyserial pyinstaller
-pyinstaller UMGT_Engine.spec
+pyinstaller --distpath ./Executable_Files UMGT_Engine.spec
 
