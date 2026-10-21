@@ -60,6 +60,10 @@ BAUD         = 115200
 # in the "%/turn" spinbox under the wheel.
 SPEED_PCT_PER_REV = 5.0
 HB_TIMEOUT_S = 3.5
+# Closing the window must never depend on a serial driver letting go. If a
+# clean shutdown has not finished within this many seconds, the process
+# exits anyway.
+SHUTDOWN_GRACE_S = 3.0
 
 PARAMS_FILE  = os.path.join(os.path.expanduser("~"), ".umgt_engine_params.json")
 
@@ -145,40 +149,90 @@ CSV_FIELDS = ["time", "elapsed_s", "state", "fault", "rpm", "tit_c", "glow_c",
 
 
 # ── Serial worker ─────────────────────────────────────────────────────────────
+def _safe_close(ser):
+    """Close a port, swallowing anything it throws. May never return."""
+    try:
+        ser.close()
+    except Exception:
+        pass
+
+
 class SerialWorker(threading.Thread):
     def __init__(self, port, baud, rx_q, tx_q):
         super().__init__(daemon=True)
         self.port, self.baud = port, baud
         self.rx_q, self.tx_q = rx_q, tx_q
-        self._stop = threading.Event()
+        # NOT named _stop: threading.Thread._stop() is an internal method of
+        # the base class. Shadowing it with an Event made every later
+        # is_alive() raise TypeError once the thread had actually finished.
+        self._stop_evt = threading.Event()
+        # Set as soon as the read loop ends, BEFORE the close is attempted —
+        # so a close wedged in the driver still counts as "link gone" instead
+        # of leaving the GUI showing a connection that no longer exists.
+        self.finished = threading.Event()
 
     def run(self):
         try:
-            with serial.Serial(self.port, self.baud, timeout=0.05) as ser:
-                self.rx_q.put(("status", f"Connected to {self.port}"))
-                buf = b""
-                while not self._stop.is_set():
+            ser = serial.Serial(self.port, self.baud, timeout=0.05)
+        except Exception as e:                  # port busy, gone, denied…
+            self.rx_q.put(("error", f"{self.port}: {e}"))
+            self.rx_q.put(("status", "Disconnected"))
+            self.finished.set()
+            return
+
+        self.rx_q.put(("status", f"Connected to {self.port}"))
+        status = "Disconnected"
+        buf = b""
+        try:
+            while not self._stop_evt.is_set():
+                # Pulling the USB cable does NOT always raise SerialException.
+                # On Windows the device node vanishes and pyserial surfaces a
+                # bare OSError from ClearCommError/ReadFile, which the old
+                # "except serial.SerialException" never caught — so the thread
+                # died silently and the GUI went on believing it was connected.
+                try:
                     while not self.tx_q.empty():
                         ser.write(self.tx_q.get_nowait())
                     chunk = ser.read(512)
-                    if chunk:
-                        buf += chunk
-                        if len(buf) > 4096:
-                            buf = buf[-1024:]
-                        while b"\n" in buf:
-                            line, buf = buf.split(b"\n", 1)
-                            txt = "".join(
-                                chr(b) if 32 <= b < 127 or b == 9 else "·"
-                                for b in line).strip("· \t\r")
-                            if txt:
-                                self.rx_q.put(("line", txt))
-        except serial.SerialException as e:
-            self.rx_q.put(("error", str(e)))
+                except queue.Empty:
+                    continue
+                except Exception as e:
+                    status = "Disconnected — link lost"
+                    self.rx_q.put(("error", f"link lost: {e}"))
+                    break
+                if chunk:
+                    buf += chunk
+                    if len(buf) > 4096:
+                        buf = buf[-1024:]
+                    while b"\n" in buf:
+                        line, buf = buf.split(b"\n", 1)
+                        txt = "".join(
+                            chr(b) if 32 <= b < 127 or b == 9 else "·"
+                            for b in line).strip("· \t\r")
+                        if txt:
+                            self.rx_q.put(("line", txt))
         finally:
-            self.rx_q.put(("status", "Disconnected"))
+            self.finished.set()
+            self.rx_q.put(("status", status))
+            self._close_quietly(ser)
+
+    @staticmethod
+    def _close_quietly(ser):
+        """Close the port without ever blocking this thread.
+
+        Closing a handle whose USB device has already been yanked can block
+        inside the driver indefinitely (Windows CloseHandle/CancelIo). The old
+        code closed via `with`, so the worker thread wedged there forever and
+        never finished — which is what left the app un-closable. Hand the close
+        to a throwaway thread and walk away if it does not come back.
+        """
+        closer = threading.Thread(target=_safe_close, args=(ser,),
+                                  daemon=True, name="serial-close")
+        closer.start()
+        closer.join(1.0)        # normally instant; give up rather than hang
 
     def stop(self):
-        self._stop.set()
+        self._stop_evt.set()
 
 
 # ── Strip chart (LabVIEW-style waveform chart) ───────────────────────────────
@@ -646,6 +700,7 @@ class EngineDashboard(tk.Tk):
         self._eng_state = "OFF"
         self._connect_t = None
         self._data_seen = False
+        self._link_lost = False
 
         # Anti-bounce: while the user is dragging a control (and for a grace
         # period after release, until the ECU echoes the new value back) the
@@ -2172,11 +2227,31 @@ class EngineDashboard(tk.Tk):
             self._conn_btn.config(text="Disconnect", fg=RED)
             self._connect_t = time.time()
             self._data_seen = False
+            self._link_lost = False
             # ESP32 resets on connect; after boot enable the stream + pull params
             self.after(3000, lambda: self._send("stream on"))
             self.after(3200, lambda: self._send("eng params"))
             # fallback: if no DATA has arrived a few seconds in, force it on
             self.after(6000, self._ensure_stream)
+
+    def _check_link(self):
+        """Notice a cable that was pulled without anyone pressing Disconnect.
+
+        The worker reports the loss through the queue, but it can also simply
+        stop (or wedge in a driver close), so the button and status are driven
+        off whether it is still reading — not off what it last told us.
+        """
+        if self._worker is None or self._link_lost:
+            return
+        if self._worker.is_alive() and not self._worker.finished.is_set():
+            return
+        self._link_lost = True
+        self._connect_t = None
+        self._conn_btn.config(text="Connect", fg=GREEN)
+        self._status_lbl.config(text="●  Disconnected", fg=RED)
+        self._elapsed_lbl.config(text="t = 0 s")
+        self._log("serial link closed — cable unplugged? "
+                  "Press Connect to reattach", "fault")
 
     def _ensure_stream(self):
         if self._worker and self._worker.is_alive() and not self._data_seen:
@@ -2337,7 +2412,12 @@ class EngineDashboard(tk.Tk):
         # finally — a single malformed line can never kill the ingestion loop
         # (which used to freeze the whole UI, charts included).
         try:
-            while True:
+            # Bounded: an unplug (or a wedged device) can dump a burst of
+            # garbage lines, and an unbounded drain would keep the main thread
+            # inside this loop instead of returning to the event loop — the
+            # window would stop responding and have to be killed. Whatever is
+            # left over is picked up 40 ms later.
+            for _ in range(200):
                 try:
                     kind, text = self._rx_q.get_nowait()
                 except queue.Empty:
@@ -2710,6 +2790,7 @@ class EngineDashboard(tk.Tk):
                 chart.redraw()
             except Exception:
                 pass   # one bad chart must not stop the others
+        self._check_link()
         if self._connect_t and self._worker and self._worker.is_alive():
             self._elapsed_lbl.config(
                 text=f"t = {int(time.time() - self._connect_t)} s")
@@ -2737,11 +2818,36 @@ class EngineDashboard(tk.Tk):
                 pass          # widget torn down during shutdown
 
     def _on_close(self):
+        # Arm a hard exit FIRST. If any step below wedges — most likely a
+        # serial close still blocked in a driver whose USB device is already
+        # gone — the process goes away anyway instead of needing End Task.
+        # The timer is a daemon, so a clean shutdown simply outruns it.
+        bail = threading.Timer(SHUTDOWN_GRACE_S, os._exit, (0,))
+        bail.daemon = True
+        bail.start()
+
+        for step in (self._close_csv, self._stop_worker):
+            try:
+                step()
+            except Exception:
+                pass            # nothing here may stand between X and exit
+        try:
+            self.quit()         # drop out of mainloop even if destroy stalls
+        finally:
+            try:
+                self.destroy()
+            except Exception:
+                pass
+
+    def _close_csv(self):
         if self._recording and self._csv_file:
             self._csv_file.close()
-        if self._worker and self._worker.is_alive():
+            self._csv_file = None
+
+    def _stop_worker(self):
+        if self._worker:
             self._worker.stop()
-        self.destroy()
+            self._worker = None
 
 
 def _is_float(s):
